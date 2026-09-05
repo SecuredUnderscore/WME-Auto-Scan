@@ -1,0 +1,15 @@
+# Local AI working context — never published
+CLAUDE.md
+
+# Dependencies
+node_modules/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# Logs & temp
+*.log
