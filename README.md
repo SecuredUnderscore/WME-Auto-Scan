@@ -2,28 +2,22 @@
 
 A customizable, passive background scanner for the [Waze Map Editor](https://www.waze.com/editor). Select an area, click **Run**, and the script monitors it on a timer—sending **Discord** and/or **Pushover** notifications whenever it detects new road closures, user edits, Update Requests (URs), or Map Suggestions.
 
-WME Auto Scan runs directly in your browser via the official WME SDK: no proprietary APIs, no external server dependencies, and every setting is fully configurable.
+WME Auto Scan runs directly in your browser via the official WME SDK.
 
 **[Install on Greasy Fork](https://greasyfork.org/)** · **[Source & issues on GitHub](https://github.com/SecuredUnderscore/WME-Auto-Scan)**
-
-> _Greasy Fork link is a placeholder until the first published version — update it once the script is live._
 
 ---
 
 ## Features
 
 - **Independent Detectors** — Toggle and configure each scan type separately:
-  - **Road closures** — New segment closures in your area.
-  - **User edits** — Edits by other editors, with a configurable per-user cooldown to prevent notification spam.
-  - **Update Requests (URs)** — New driver-submitted reports.
-  - **Map Suggestions** — Automated map changes suggested by Waze.
+  - **Road closures**
+  - **User edits** — Edits by other editors.
+  - **Update Requests (URs)**
+  - **Map Suggestions**
 - **Flexible Region Selection** — Choose an area from your **managed areas**, **search for a place** (city, county, country via OpenStreetMap), or **draw a polygon** directly on the map.
-- **Tile Mask Optimization** — Perform a one-time scan to map road-bearing tiles. Subsequent scans skip water and empty land, speeding up cycles without missing closures.
-- **Granular Notifications** — Rich embeds for **Discord** and custom sounds for **Pushover**. Use global channels or configure per-detector overrides.
-- **Editor Whitelist** — Ignore events from specific editors (your own account is whitelisted automatically). Add names manually or use **Find editors in view**.
-- **Map Overlays & Previews** — Click 👁 to outline your saved region or preview the exact tiles scheduled for scanning.
-- **Direct Permalinks** — Every alert includes a permalink centered on the triggering feature.
-- **Private & Local** — Configuration is saved in local storage. Network requests are limited to WME, your chosen notification endpoints, and OpenStreetMap (for place search).
+- **Tile Mask Optimization** — Perform a one-time scan to map road-bearing tiles. Subsequent scans skip water and empty land speeding up cycles.
+- **Editor Whitelist** — Ignore events from specific editors.
 
 ---
 
@@ -33,7 +27,7 @@ WME Auto Scan runs directly in your browser via the official WME SDK: no proprie
 2. Install the script from **[Greasy Fork](https://greasyfork.org/)**.
 3. Open the [Waze Map Editor](https://www.waze.com/editor). The **Auto Scan** tab will appear in the left sidebar.
 
-*(Optional)* Notification requirements:
+Notification options:
 - **Discord:** Webhook URL (*Channel Settings → Integrations → Webhooks*).
 - **Pushover:** Application **API Token** and **User/Group Key** from [pushover.net](https://pushover.net/).
 
@@ -70,20 +64,6 @@ Open the **Auto Scan** tab in the sidebar to access **Settings** and **Run** mod
 3. Click **Stop** at any time to halt the loop.
 
 > ⚠️ **Update Requests & Map Suggestions:** These are read through WME's Issue Tracker, so a scan only sees what your **current map filters** allow. For complete results, clear all filters before scanning.
-
----
-
-## Notes & Technical Details
-
-- **Zoom Level:** Scanning runs at zoom level 15. The script checks layers loaded by WME and will not force-load unrendered layers.
-- **Place Search:** Location search uses OpenStreetMap Nominatim. Boundary polygons are simplified on import to keep scan times fast.
-- **Network:** External requests (Discord, Pushover, Nominatim) are handled via `GM_xmlhttpRequest`.
-
----
-
-## Contributing & Feedback
-
-Bug reports, feature requests, and pull requests are welcome on **[GitHub](https://github.com/SecuredUnderscore/WME-Auto-Scan/issues)**.
 
 ## License
 
