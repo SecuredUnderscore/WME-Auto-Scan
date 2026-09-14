@@ -4,7 +4,7 @@ A customizable, passive background scanner for the [Waze Map Editor](https://www
 
 WME Auto Scan runs directly in your browser via the official WME SDK.
 
-**[Install on Greasy Fork](https://greasyfork.org/)** · **[Source & issues on GitHub](https://github.com/SecuredUnderscore/WME-Auto-Scan)**
+**[Install on Greasy Fork](https://greasyfork.org/en/scripts/595728-wme-auto-scan)** · **[Source & issues on GitHub](https://github.com/SecuredUnderscore/WME-Auto-Scan)**
 
 ---
 
@@ -24,7 +24,7 @@ WME Auto Scan runs directly in your browser via the official WME SDK.
 ## Installation
 
 1. Install a userscript manager: [Tampermonkey](https://www.tampermonkey.net/) (recommended) or [Violentmonkey](https://violentmonkey.github.io/).
-2. Install the script from **[Greasy Fork](https://greasyfork.org/)**.
+2. Install the script from **[Greasy Fork](https://greasyfork.org/en/scripts/595728-wme-auto-scan)**.
 3. Open the [Waze Map Editor](https://www.waze.com/editor). The **Auto Scan** tab will appear in the left sidebar.
 
 Notification options:
@@ -67,4 +67,4 @@ Open the **Auto Scan** tab in the sidebar to access **Settings** and **Run** mod
 
 ## License
 
-[MIT](https://github.com/SecuredUnderscore/WME-Auto-Scan/blob/main/LICENSE) © SecuredUnderscore
+[MIT](https://github.com/SecuredUnderscore/WME-Auto-Scan/blob/main/LICENSE)
