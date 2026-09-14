@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME Auto Scan
 // @namespace    https://github.com/SecuredUnderscore/WME-Auto-Scan
-// @version      0.6.2
+// @version      0.1.0
 // @description  Scans a selected area in Waze Map Editor for road closures, user edits, update requests, and map suggestions, and sends notifications to Discord or Pushover.
 // @author       SecuredUnderscore
 // @match        https://www.waze.com/editor*
