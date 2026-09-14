@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         WME Auto Scan
 // @namespace    https://github.com/SecuredUnderscore/WME-Auto-Scan
-// @version      0.3.0
-// @description  Scans a selected area in Waze Map Editor for road closures and sends notifications to Discord or Pushover. Optional optimization skips areas without roads.
+// @version      0.6.2
+// @description  Scans a selected area in Waze Map Editor for road closures, user edits, update requests, and map suggestions, and sends notifications to Discord or Pushover.
 // @author       SecuredUnderscore
 // @match        https://www.waze.com/editor*
 // @match        https://www.waze.com/*/editor*
@@ -40,12 +40,11 @@
   const TILE_OVERLAP = 0.85; // fraction of viewport advanced per tile step
   const MAP_DATA_TIMEOUT_MS = 9000; // max wait for a tile's data to load
   const MAP_SETTLE_MS = 650; // extra settle time so canvases finish drawing
-  // Scan-loop pacing: rather than always waiting the full settle, the scan moves
-  // on as soon as the tile signals loaded (plus a short base dwell). This saves
-  // ~200-500 ms/tile, especially on optimized runs where tiles load fast.
-  const SCAN_SETTLE_MS = 150; // base dwell after a tile's data loads before collecting
-  const SCAN_NO_LOAD_GRACE = 500; // if no load event fires, assume the tile was already loaded
-  const SCAN_POLL_MS = 50; // how often the scan loop polls for the load signal
+  // Fast/cached tiles target 300 ms; busy tiles wait for both loading states to
+  // clear. A short idle confirmation catches consecutive merge events.
+  const SCAN_MIN_DWELL_MS = 300;
+  const SCAN_SETTLE_MS = 50;
+  const SCAN_POLL_MS = 25;
   const ENABLE_SCREENSHOTS = false; // temporarily disabled (black-capture WIP)
 
   // --- Optimization "tile mask" -------------------------------------------
@@ -119,10 +118,11 @@
         pushoverSound: "pushover",
       },
       whitelist: [], // usernames whose events are suppressed
+      whitelistSeeded: false, // set once we've added the current user by default
       region: null, // GeoJSON Polygon coordinates (rings of [lon,lat]) + label
       detectors: {
         closure: { ...detector(), enabled: true },
-        edit: detector(),
+        edit: { ...detector(), cooldownMin: 60 },
         report: detector(),
         suggestion: detector(),
       },
@@ -240,6 +240,18 @@
 
   function centroidOfBbox(bbox) {
     return { lon: (bbox[0] + bbox[2]) / 2, lat: (bbox[1] + bbox[3]) / 2 };
+  }
+
+  // Bounding box [minLon, minLat, maxLon, maxLat] of any GeoJSON geometry.
+  function geometryBbox(geometry) {
+    if (!geometry) return null;
+    let ring;
+    if (geometry.type === "Point") ring = [geometry.coordinates];
+    else if (geometry.type === "LineString") ring = geometry.coordinates;
+    else if (geometry.type === "Polygon") ring = geometry.coordinates[0] || [];
+    else return null;
+    if (!ring.length) return null;
+    return bboxOfRing(ring);
   }
 
   // --- Polygon simplification (Douglas–Peucker) ---------------------------
@@ -380,8 +392,8 @@
   }
 
   // A notification is { title, color, discordDescription, plainText, screenshots:[dataUrl] }
-  async function sendNotification(detectorKey, note) {
-    const ch = resolveChannels(detectorKey);
+  async function sendNotification(detectorKey, note, channels = null) {
+    const ch = channels || resolveChannels(detectorKey);
     const results = [];
     if (ch.discordWebhook) {
       try {
@@ -496,29 +508,59 @@
     return wait;
   }
 
-  // Scan-loop move: proactively poll for the load signal and proceed the moment
-  // a tile is ready instead of blocking on a fixed settle. Proceeds when either
-  // (a) a data-loaded event fires and a short base dwell has elapsed, or (b) no
-  // load event arrives within the grace window (the tile was already loaded).
-  async function moveForScan(center) {
-    let loadedAt = 0;
-    const onLoad = () => { if (!loadedAt) loadedAt = performance.now(); };
-    try { sdk.Events.on({ eventName: "wme-map-data-loaded", eventHandler: onLoad }); } catch (e) {}
+  // EXPLICIT SDK-ONLY EXCEPTION — authorized by the user on 2026-09-06,
+  // ONLY for detecting map-load completion. Read these two WME internal loading
+  // flags; do not use internal data models, call private endpoints, initiate
+  // requests, or change WME internals. All scan data still comes from the SDK.
+  // sdk.State.isMapLoading() becomes false on ANY operationDone, even if another
+  // operation is pending. WME tracks these flags independently: loadingFeatures
+  // for roads and loadingIssueTrackerMapData for the combined Issue Tracker bbox
+  // requests (including Update Requests and Map Suggestions), through model merge.
+  // Keep this narrowly scoped exception here. If WME changes the flags, fail the
+  // scan rather than silently falling back to the unreliable shared SDK flag.
+  function scanMapIsLoading() {
+    const app = PAGE.W && PAGE.W.app;
+    if (!app || typeof app.get !== "function") {
+      throw new Error("WME load tracking is unavailable. Scan stopped; baseline was not updated.");
+    }
+    const roads = app.get("loadingFeatures");
+    const issues = app.get("loadingIssueTrackerMapData");
+    if (typeof roads !== "boolean" || typeof issues !== "boolean") {
+      throw new Error("WME load tracking has changed. Scan stopped; baseline was not updated.");
+    }
+    return roads || issues;
+  }
+
+  // Wait for BOTH independent loaders, with a short idle confirmation after
+  // the last merge. Scan-wide SDK listeners collect arriving objects throughout.
+  async function moveForScan(center, collect = () => {}) {
+    scanMapIsLoading(); // validate the narrowly permitted internal API before moving
     const t0 = performance.now();
-    sdk.Map.setMapCenter({ lonLat: center, zoomLevel: SCAN_ZOOM });
+    let lastActivity = t0;
+    let idleSince = null;
+    const onLoad = () => { lastActivity = performance.now(); };
+    const events = ["wme-map-move-end", "wme-map-data-loaded", "wme-data-model-objects-added", "wme-data-model-objects-changed"];
+    for (const eventName of events) sdk.Events.on({ eventName, eventHandler: onLoad });
     try {
+      sdk.Map.setMapCenter({ lonLat: center, zoomLevel: SCAN_ZOOM });
       for (;;) {
+        if (!scanState.running) return false;
         const now = performance.now();
-        if (loadedAt) {
-          if (now - loadedAt >= SCAN_SETTLE_MS) break; // loaded, brief settle done
-        } else if (now - t0 >= SCAN_NO_LOAD_GRACE) {
-          break; // nothing loaded — tile was already present, don't wait longer
+        if (scanMapIsLoading()) idleSince = null;
+        else {
+          if (idleSince === null) idleSince = now;
+          if (now - t0 >= SCAN_MIN_DWELL_MS && now - Math.max(lastActivity, idleSince) >= SCAN_SETTLE_MS) {
+            collect();
+            return true;
+          }
         }
-        if (now - t0 >= MAP_DATA_TIMEOUT_MS) break; // hard cap
+        if (now - t0 >= MAP_DATA_TIMEOUT_MS) {
+          throw new Error("Map data did not settle. Scan incomplete; baseline was not updated. Try again when WME has finished loading.");
+        }
         await sleep(SCAN_POLL_MS);
       }
     } finally {
-      try { sdk.Events.off({ eventName: "wme-map-data-loaded", eventHandler: onLoad }); } catch (e) {}
+      for (const eventName of events) sdk.Events.off({ eventName, eventHandler: onLoad });
     }
   }
 
@@ -729,7 +771,7 @@
     try {
       let grid, cells;
       const mask = loadMask(region);
-      if (mask && mask.complete && mask.grid && Array.isArray(mask.productive) && mask.productive.length) {
+      if (mask && mask.complete && mask.grid && Array.isArray(mask.productive)) {
         grid = mask.grid;
         cells = mask.productive;
       } else {
@@ -767,7 +809,47 @@
   // ---------------------------------------------------------------------------
   // Link builders
   // ---------------------------------------------------------------------------
-  function buildLinks(centroid, segmentIds) {
+  const MIN_FIT_ZOOM = 12, MAX_FIT_ZOOM = 20, DEFAULT_POINT_ZOOM = 17;
+
+  // Zoom level whose viewport contains bbox ([minLon,minLat,maxLon,maxLat]),
+  // mirroring sdk.Map.zoomToExtent without moving the live map (which the scan
+  // is still driving). Degenerate/absent boxes fall back to a close point zoom.
+  function zoomForBbox(bbox) {
+    if (!bbox) return DEFAULT_POINT_ZOOM;
+    const [minLon, minLat, maxLon, maxLat] = bbox;
+    const lonSpan = maxLon - minLon, latSpan = maxLat - minLat;
+    if (!(lonSpan > 0) && !(latSpan > 0)) return DEFAULT_POINT_ZOOM;
+    let view = { w: 1200, h: 800 };
+    try {
+      const el = sdk.Map.getMapViewportElement();
+      if (el && el.clientWidth && el.clientHeight) view = { w: el.clientWidth, h: el.clientHeight };
+    } catch (e) { /* not mounted; use defaults */ }
+    const worldPx = 256, pad = 0.8; // tile size at zoom 0; leave a margin around the feature
+    const merc = (lat) => Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI / 180) / 2));
+    const zoomLon = lonSpan > 0 ? Math.log2((view.w * pad) * 360 / (worldPx * lonSpan)) : Infinity;
+    const latFrac = Math.abs(merc(maxLat) - merc(minLat)) / (2 * Math.PI);
+    const zoomLat = latFrac > 0 ? Math.log2((view.h * pad) / (worldPx * latFrac)) : Infinity;
+    const z = Math.floor(Math.min(zoomLon, zoomLat));
+    return Math.max(MIN_FIT_ZOOM, Math.min(MAX_FIT_ZOOM, z));
+  }
+
+  // getPermalink() encodes the *current* map view — during a scan that is the
+  // last tile visited, not the feature. Rewrite lon/lat (and zoom) so the link
+  // lands on and fits the feature rather than wherever the scan finished.
+  function permalinkAt(permalink, centroid, zoom) {
+    const set = (url, key, value) => (value == null ? url :
+      new RegExp(`[?&]${key}=`).test(url)
+        ? url.replace(new RegExp(`([?&]${key}=)[^&]*`), `$1${value}`)
+        : `${url}${url.includes("?") ? "&" : "?"}${key}=${value}`);
+    let url = permalink;
+    if (centroid && Number.isFinite(centroid.lat) && Number.isFinite(centroid.lon)) {
+      url = set(set(url, "lon", centroid.lon), "lat", centroid.lat);
+    }
+    if (Number.isFinite(zoom)) url = set(url, "zoomLevel", zoom);
+    return url;
+  }
+
+  function buildLinks(centroid, segmentIds, bbox) {
     const links = {};
     // WME permalink: select the segments, then read the permalink so WME
     // encodes the selection for us; fall back to manual &segments=.
@@ -783,7 +865,7 @@
     if (segmentIds && segmentIds.length && !/[?&]segments=/.test(wme)) {
       wme += (wme.includes("?") ? "&" : "?") + "segments=" + segmentIds.join(",");
     }
-    links.wme = wme;
+    links.wme = permalinkAt(wme, centroid, zoomForBbox(bbox));
     const { lat, lon } = centroid;
     links.livemap = `https://www.waze.com/live-map/directions?to=ll.${lat}%2C${lon}`;
     links.wazeApp = `https://waze.com/ul?ll=${lat}%2C${lon}&navigate=yes`;
@@ -811,7 +893,6 @@
 
   function isWhitelisted(name) {
     if (!name) return false;
-    if (selfUserName && name.toLowerCase() === selfUserName.toLowerCase()) return true;
     return settings.whitelist.some((w) => w.toLowerCase() === name.toLowerCase());
   }
 
@@ -820,6 +901,75 @@
   // ---------------------------------------------------------------------------
   function roadTypeName(id) {
     return roadTypeNames[id] || ROAD_TYPE_FALLBACK[id] || `road type ${id}`;
+  }
+
+  // Human labels for WME update-request types, sources, and severities.
+  const UPDATE_REQUEST_TYPE_NAMES = {
+    BLOCKED_ROAD: "Blocked road",
+    INCORRECT_ADDRESS: "Incorrect address",
+    INCORRECT_GENERAL_ERROR: "General error",
+    INCORRECT_JUNCTION: "Incorrect junction",
+    INCORRECT_MISSING_ROUNDABOUT: "Missing roundabout",
+    INCORRECT_ROUTE: "Incorrect route",
+    INCORRECT_TURN: "Incorrect turn",
+    MISSING_BRIDGE_OVERPASS: "Missing bridge/overpass",
+    MISSING_EXIT: "Missing exit",
+    MISSING_ROAD: "Missing road",
+    TURN_NOT_ALLOWED: "Turn not allowed",
+    WRONG_DRIVING_DIRECTIONS: "Wrong driving directions",
+  };
+  function updateRequestTypeName(type) {
+    return UPDATE_REQUEST_TYPE_NAMES[type] || type || "Update request";
+  }
+
+  const UPDATE_REQUEST_SOURCE_NAMES = {
+    MOBILE_CLIENT: "Waze app",
+    MOBILE_WEB: "Mobile web",
+    WEB: "Web",
+    REPORTING_AGENT: "Reporting agent",
+  };
+  function updateRequestSourceName(src) {
+    return UPDATE_REQUEST_SOURCE_NAMES[src] || src || null;
+  }
+
+  function severityLabel(sev) {
+    return sev ? sev.charAt(0).toUpperCase() + sev.slice(1) : "Unknown";
+  }
+
+  // WME timestamps come as numbers; normalize ms → seconds for Discord <t:…>.
+  function toDiscordUnix(n) {
+    if (n == null) return null;
+    return n > 1e12 ? Math.floor(n / 1000) : Math.floor(n);
+  }
+
+  // Human labels for WME edit-suggestion sources and suggested actions.
+  const EDIT_SUGGESTION_SOURCE_NAMES = {
+    CLIENT: "Client", GEO: "Geo", OTHER: "Other", WME: "WME", SYSTEM: "System",
+  };
+  function editSuggestionSourceName(src) {
+    return EDIT_SUGGESTION_SOURCE_NAMES[src] || src || null;
+  }
+  function actionTypeName(a) {
+    return a ? a.charAt(0).toUpperCase() + a.slice(1).toLowerCase() : a;
+  }
+
+  // GeoJSON BBox may be 2D [w,s,e,n] or 3D [w,s,minEle,e,n,maxEle]; normalize to
+  // a 2D [minLon,minLat,maxLon,maxLat] box (the format pointInBox expects).
+  function normBbox(b) {
+    return b && b.length >= 6 ? [b[0], b[1], b[3], b[4]] : b;
+  }
+  function bboxCenter(box) {
+    return [(box[0] + box[2]) / 2, (box[1] + box[3]) / 2];
+  }
+  // Does a bbox overlap the scan polygon? True if the box's ring touches/enters
+  // the region, or the region sits entirely inside the box.
+  function bboxInPolygon(box, poly) {
+    const [w, s, e, n] = box;
+    const ring = [[w, s], [e, s], [e, n], [w, n], [w, s]];
+    if (lineInPolygon(ring, poly)) return true;
+    const outer = poly[0] || [];
+    for (const pt of outer) if (pointInBox(pt, box)) return true;
+    return false;
   }
 
   function streetName(streetId) {
@@ -997,7 +1147,7 @@
 
     const bbox = padBbox(bboxOfCoords(allCoords), 0.15);
     const centroid = centroidOfBbox(bbox);
-    const links = buildLinks(centroid, segIds);
+    const links = buildLinks(centroid, segIds, bbox);
 
     // Screenshot the whole group's extent (temporarily disabled).
     let shot = null;
@@ -1058,6 +1208,488 @@
   }
 
   // ---------------------------------------------------------------------------
+  // Update request detector ("Update Requests")
+  // ---------------------------------------------------------------------------
+  // Scans WME's user-reported update requests (sdk.DataModel.MapUpdateRequests) —
+  // the map problem reports drivers file from the app. WME only loads these when
+  // the Update Requests group is enabled in the Issue Tracker filter panel, and
+  // the panel's status filter (Open/Closed) gates which ones are fetched; see
+  // updateRequestsFilterWarning(). URs carry no editor username, so the whitelist
+  // doesn't apply.
+  function makeReportDetector() {
+    const requestsById = new Map(); // dedupe across tiles
+    return {
+      key: "report",
+      collect() {
+        const list = sdk.DataModel.MapUpdateRequests.getAll();
+        for (const r of list) {
+          if (requestsById.has(r.id)) continue;         // cross-tile dedupe
+          if (!r.isOpen || r.resolvedOn != null) continue; // only open/unresolved
+          const pt = r.geometry && r.geometry.coordinates;
+          if (!pt) continue;
+          if (!pointInPolygon(pt, scanState.polygon)) continue; // region filter
+          requestsById.set(r.id, r);
+        }
+      },
+      async finalize() {
+        const items = [...requestsById.values()];
+        const store = seenFor(settings.region, "report");
+        // Which requests are newly seen this scan? Then mark everything seen.
+        const fresh = items.filter((r) => !store.ids.has(String(r.id)));
+        for (const r of items) store.ids.add(String(r.id));
+        if (!store.baseline) { store.baseline = true; return 0; } // silent first scan
+        if (!fresh.length) return 0;
+        let sent = 0;
+        for (const r of fresh) {
+          const note = buildUpdateRequestNotification(r);
+          const results = await sendNotification("report", note);
+          if (results.some((x) => x.endsWith(":ok"))) sent++;
+        }
+        return sent;
+      },
+    };
+  }
+
+  function buildUpdateRequestNotification(r) {
+    const [lon, lat] = r.geometry.coordinates;
+    const links = buildLinks({ lat, lon }, []);
+    const type = updateRequestTypeName(r.updateRequestType);
+    const sev = severityLabel(r.severity);
+    const src = updateRequestSourceName(r.source);
+    const reported = toDiscordUnix(r.reportedOn);
+
+    const md = [`**Type:** ${type}`, `**Severity:** ${sev}`];
+    const plain = [`Type: ${type}`, `Severity: ${sev}`];
+    if (src) { md.push(`**Source:** ${src}`); plain.push(`Source: ${src}`); }
+    if (reported) {
+      md.push(`**Reported:** <t:${reported}:F> (<t:${reported}:R>)`);
+      plain.push(`Reported: ${new Date(reported * 1000).toLocaleString()}`);
+    }
+    if (r.description) {
+      md.push(`**Comment:** ${r.description}`);
+      plain.push(`Comment: ${r.description}`);
+    }
+
+    return {
+      title: `Update request: ${type}`,
+      color: COLORS.report,
+      discordDescription: `${md.join("\n")}\n\n${linksMarkdown(links)}`,
+      plainText: `Update request: ${type}\n${plain.join("\n")}\n\n${linksPlain(links)}`,
+      screenshots: [],
+    };
+  }
+
+  // Read the WME Issue Tracker's active Update Requests filter and return a
+  // warning string if that filter would keep the scan from seeing open URs, else
+  // null. Note: getActiveFilters() reports `updateRequests: null` both when the
+  // group is toggled OFF (nothing is fetched) and when the status filter is the
+  // neutral "Both" (everything is fetched) — the SDK can't distinguish them, so
+  // null is treated as "fine" here and the empty-group case is covered by the
+  // persistent UI hint under the detector toggle instead.
+  function updateRequestsFilterWarning() {
+    let ur;
+    try { ur = sdk.IssueTracker.getActiveFilters().updateRequests; } catch (e) { return null; }
+    if (ur && ur.status === "CLOSED") {
+      return "WME's Issue Tracker is filtered to CLOSED update requests — the scan won't see open ones. Set the Update Requests status filter to Both (or Open).";
+    }
+    return null;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Map suggestion detector ("Map Suggestions")
+  // ---------------------------------------------------------------------------
+  // Scans WME's edit suggestions (sdk.DataModel.EditSuggestions) — Google/system
+  // suggested edits awaiting review. Same load-gating as update requests: WME
+  // only loads them when the Map Suggestions group is on in the Issue Tracker
+  // filter panel (see mapSuggestionsFilterWarning). These have no Point geometry,
+  // only a bbox, so region filtering tests the bbox against the scan polygon.
+  const SUGGESTION_OPEN_STATUSES = new Set(["OPEN", "OPEN_AND_CLOSED"]);
+  function makeSuggestionDetector() {
+    const suggestionsById = new Map(); // dedupe across tiles
+    return {
+      key: "suggestion",
+      collect() {
+        const list = sdk.DataModel.EditSuggestions.getAll();
+        for (const s of list) {
+          if (suggestionsById.has(s.id)) continue;             // cross-tile dedupe
+          if (!SUGGESTION_OPEN_STATUSES.has(s.status)) continue; // only open ones
+          const box = normBbox(s.bbox);
+          if (!box || box.length < 4) continue;
+          if (!bboxInPolygon(box, scanState.polygon)) continue;  // region filter
+          suggestionsById.set(s.id, s);
+        }
+      },
+      async finalize() {
+        const items = [...suggestionsById.values()];
+        const store = seenFor(settings.region, "suggestion");
+        const fresh = items.filter((s) => !store.ids.has(String(s.id)));
+        for (const s of items) store.ids.add(String(s.id));
+        if (!store.baseline) { store.baseline = true; return 0; } // silent first scan
+        if (!fresh.length) return 0;
+        let sent = 0;
+        for (const s of fresh) {
+          const note = buildSuggestionNotification(s);
+          const results = await sendNotification("suggestion", note);
+          if (results.some((x) => x.endsWith(":ok"))) sent++;
+        }
+        return sent;
+      },
+    };
+  }
+
+  function buildSuggestionNotification(s) {
+    const [lon, lat] = bboxCenter(normBbox(s.bbox));
+    const links = buildLinks({ lat, lon }, []);
+    const src = editSuggestionSourceName(s.source);
+    const created = toDiscordUnix(s.modificationData && s.modificationData.createdOn);
+
+    // Summarize the suggested changes (e.g. "Add segment", "Update venue").
+    const edits = (s.suggestions || []).flatMap((x) => x.edits || []);
+    const changes = [...new Set(edits.map((e) => `${actionTypeName(e.actionType)} ${e.objectType}`.trim()))];
+    const changeText = changes.length ? changes.join(", ") : "Suggested edit";
+
+    const md = [`**Changes:** ${changeText}`];
+    const plain = [`Changes: ${changeText}`];
+    if (src) { md.push(`**Source:** ${src}`); plain.push(`Source: ${src}`); }
+    if (created) {
+      md.push(`**Created:** <t:${created}:F> (<t:${created}:R>)`);
+      plain.push(`Created: ${new Date(created * 1000).toLocaleString()}`);
+    }
+
+    return {
+      title: `Map suggestion: ${changeText}`.slice(0, 256),
+      color: COLORS.suggestion,
+      discordDescription: `${md.join("\n")}\n\n${linksMarkdown(links)}`,
+      plainText: `Map suggestion\n${plain.join("\n")}\n\n${linksPlain(links)}`,
+      screenshots: [],
+    };
+  }
+
+  // Warn if the Issue Tracker's Map Suggestions filter would hide open ones.
+  // Status "OPEN" (only open) and null (neutral/off) are fine; any other single
+  // status (CLOSED_ALL, REJECTED_ALL, APPROVED_BY_GOOGLE, …) excludes open ones.
+  function mapSuggestionsFilterWarning() {
+    let ms;
+    try { ms = sdk.IssueTracker.getActiveFilters().mapSuggestions; } catch (e) { return null; }
+    if (ms && ms.status && ms.status !== "OPEN") {
+      return `WME's Issue Tracker is filtered to "${ms.status}" map suggestions — the scan won't see open ones. Set the Map Suggestions status filter to Open (or neutral).`;
+    }
+    return null;
+  }
+
+  // ---------------------------------------------------------------------------
+  // User edits: metadata discovery + paginated, read-only ElementHistory.
+  // Keep this undocumented endpoint isolated: unexpected data fails closed.
+  // ---------------------------------------------------------------------------
+  const EDIT_STORAGE_PREFIX = "wme-auto-scan:edits:v1:";
+  // An object's data-model updatedOn can sit ahead of its newest ElementHistory
+  // own-transaction: related-object edits (moving a node, turn/connection edits,
+  // house numbers) bump updatedOn without producing a segment/venue transaction,
+  // and timestamps can differ by sub-second rounding. That's a normal steady
+  // state, not lag, so the "caught up" check must not retry it forever. We only
+  // keep retrying while the edit is still fresh enough to be genuine replication
+  // lag; past that window we accept the newest own-transaction as the caught-up
+  // point so the retry queue can't wedge. (Any own-transaction within range is
+  // still reported regardless — accepting here only forgoes waiting for one that
+  // has not appeared in the endpoint yet.)
+  const EDIT_CAUGHT_UP_GRACE_MS = 20000;
+  let editStatus = "Not scanned yet.";
+
+  function editTime(value) {
+    const n = typeof value === "number" ? value : Number(value);
+    if (!Number.isFinite(n) || n <= 0) throw new Error("Missing edit timestamp");
+    return n < 1e12 ? n * 1000 : n;
+  }
+
+  function editEndpoint() {
+    const region = sdk.Settings.getRegionCode();
+    const bases = { usa: "/Descartes/app", row: "/row-Descartes/app", il: "/il-Descartes/app" };
+    if (!bases[region]) throw new Error("Unknown WME server region");
+    return new URL(bases[region] + "/ElementHistory", PAGE.location.origin);
+  }
+
+  async function fetchEditHistory(endpoint, item, cursor) {
+    const url = new URL(endpoint);
+    url.searchParams.set("objectType", item.type);
+    url.searchParams.set("objectID", item.id);
+    if (cursor != null) url.searchParams.set("till", cursor);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15000);
+    try {
+      const response = await fetch(url.href, { credentials: "same-origin", signal: controller.signal });
+      if (!response.ok) throw new Error(`History HTTP ${response.status}`);
+      const page = await response.json();
+      if (!Array.isArray(page.transactions?.objects)) throw new Error("Unrecognized history response");
+      return page;
+    } finally { clearTimeout(timer); }
+  }
+
+  function editGeometryInRegion(geometry, polygon) {
+    if (!geometry) return false;
+    if (geometry.type === "Point") return pointInPolygon(geometry.coordinates, polygon);
+    if (geometry.type === "LineString") return lineInPolygon(geometry.coordinates, polygon);
+    if (geometry.type === "Polygon") {
+      return geometry.coordinates.some((ring) => lineInPolygon(ring, polygon)) ||
+        polygon[0].some((pt) => pointInPolygon(pt, geometry.coordinates));
+    }
+    return false;
+  }
+
+  function setEditStatus(message) {
+    editStatus = message;
+    const node = tabPane && tabPane.querySelector(".was-edit-status");
+    if (node) node.textContent = message;
+  }
+
+  // A checkpoint retains IDs at its timestamp so equally dated transactions
+  // can be fetched again without dropping or double-counting them.
+  async function readNewEditEvents(endpoint, item, checkpoint, budget, persistProgress = () => {}) {
+    const progress = item.progress;
+    let cursor = progress?.cursor ?? null;
+    const cursors = new Set(progress?.cursors || []);
+    const users = new Map(progress?.users || []);
+    const transactions = new Map(progress?.transactions || []);
+    let newest = progress?.newest || 0;
+    let complete = false;
+    for (let pageNumber = 0; pageNumber < 20; pageNumber++) {
+      if (!scanState.running) throw new Error("History paused");
+      if (budget.remaining-- <= 0) throw new Error("History request budget reached; continuing next scan");
+      await sleep(1000);
+      if (!scanState.running) throw new Error("History paused");
+      const page = await fetchEditHistory(endpoint, item, cursor);
+      for (const user of page.users?.objects || []) {
+        if (typeof user.userName === "string") users.set(String(user.id), user.userName);
+      }
+      let older = false;
+      for (const tx of page.transactions.objects) {
+        const date = editTime(tx.date);
+        newest = Math.max(newest, date);
+        if (date < checkpoint.time) { older = true; continue; }
+        if (date > item.time) continue; // leave concurrent edits for the next observation
+        if (tx.transactionID == null || !Array.isArray(tx.objects)) throw new Error("Unrecognized history transaction");
+        const id = String(tx.transactionID);
+        if (date === checkpoint.time && (checkpoint.baseline || checkpoint.ids.includes(id))) continue;
+        // Related objects (nodes, turns, etc.) are not separate segment/place edits.
+        const object = tx.objects.find((o) => o.objectType === item.type && String(o.objectID) === item.id);
+        if (!object) continue;
+        const action = object.actionType || tx.actionType;
+        if (!["ADD", "UPDATE", "DELETE"].includes(action)) throw new Error("Unknown history action");
+        if (tx.userID == null) throw new Error("History actor missing");
+        transactions.set(id, { id, date, userID: String(tx.userID), type: item.type, objectId: item.id, bbox: item.bbox });
+      }
+      const next = page.transactions.nextTransaction;
+      if (older || next == null) { complete = true; break; }
+      if (cursors.has(String(next))) throw new Error("History pagination repeated a cursor");
+      cursors.add(String(next));
+      cursor = next;
+      item.progress = { cursor, cursors: [...cursors], users: [...users], transactions: [...transactions], newest };
+      persistProgress();
+    }
+    if (!complete) throw new Error("Long history paused after 20 pages; continuing next scan");
+    delete item.progress;
+    // Compare at whole-second granularity so sub-second rounding never wedges.
+    // Only retry while the edit is fresh enough to plausibly still be replicating;
+    // an older gap means updatedOn was bumped without an own-transaction — accept it.
+    if (Math.floor(newest / 1000) < Math.floor(item.time / 1000) &&
+        Date.now() - item.time < EDIT_CAUGHT_UP_GRACE_MS)
+      throw new Error("History has not caught up with map metadata; retry pending");
+    const events = [...transactions.values()].map((event) => {
+      const name = users.get(event.userID);
+      if (!name) throw new Error("History username missing; retry pending");
+      return { ...event, name, delivered: [] };
+    });
+    return {
+      events,
+      checkpoint: { time: item.time, ids: [...new Set([
+        ...(checkpoint.time === item.time ? checkpoint.ids : []),
+        ...events.filter((e) => e.date === item.time).map((e) => e.id),
+      ])] },
+    };
+  }
+
+  // Base WME permalink for the current map view, stripped of any object
+  // selection so we can append a single segment/place per link below.
+  function editPermalinkBase() {
+    let base;
+    try { base = sdk.Map.getPermalink(); } catch (e) { return "https://www.waze.com/editor"; }
+    return base
+      .replace(/([?&])(segments|venues)=[^&]*/g, "$1")
+      .replace(/&&+/g, "&").replace(/\?&/, "?").replace(/[?&]$/, "");
+  }
+
+  function objectPermalink(base, type, id, bbox) {
+    const param = type === "venue" ? "venues" : "segments";
+    // Land on and fit the object, and select it via the id param, rather than
+    // inheriting the last scanned tile's view.
+    const at = permalinkAt(base, bbox && centroidOfBbox(bbox), zoomForBbox(bbox));
+    return `${at}${at.includes("?") ? "&" : "?"}${param}=${id}`;
+  }
+
+  const EDIT_PERMALINK_LIMIT = 3;
+
+  function buildEditNotification(name, events) {
+    const base = editPermalinkBase();
+    const bboxById = new Map();
+    for (const e of events) if (e.bbox && !bboxById.has(e.objectId)) bboxById.set(e.objectId, e.bbox);
+    const lines = [];
+    const plainLines = [];
+    for (const [type, label] of [["segment", "Segment"], ["venue", "Place"]]) {
+      const items = events.filter((e) => e.type === type);
+      if (!items.length) continue;
+      const ids = [...new Set(items.map((e) => e.objectId))];
+      const noun = label.toLowerCase();
+      const summary = `${items.length} ${label} edit${items.length === 1 ? "" : "s"} across ${ids.length} unique ${noun}${ids.length === 1 ? "" : "s"}`;
+      const shown = ids.slice(0, EDIT_PERMALINK_LIMIT);
+      const more = ids.length > shown.length ? ` +${ids.length - shown.length} more` : "";
+      const linksMd = shown.map((id) => `[${id}](${objectPermalink(base, type, id, bboxById.get(id))})`).join(" ");
+      const linksPlain = shown.map((id) => `${id}: ${objectPermalink(base, type, id, bboxById.get(id))}`).join("\n    ");
+      lines.push(`- ${summary} — ${linksMd}${more}`);
+      plainLines.push(`- ${summary}${more}\n    ${linksPlain}`);
+    }
+    const dates = events.map((e) => e.date);
+    const period = `${new Date(dates.reduce((a, b) => Math.min(a, b), Infinity)).toLocaleString()} – ${new Date(dates.reduce((a, b) => Math.max(a, b), 0)).toLocaleString()}`;
+    return {
+      title: `User edits: ${name}`,
+      color: COLORS.edit,
+      discordDescription: `${period}\n${lines.join("\n")}\n\n[User Profile](${PROFILE_URL(name)})`,
+      plainText: `${period}\n${plainLines.join("\n")}\n\nUser Profile: ${PROFILE_URL(name)}`,
+      screenshots: [],
+    };
+  }
+
+  async function deliverEditEvents(store, persist) {
+    const ch = resolveChannels("edit");
+    const channels = [];
+    if (ch.discordWebhook) channels.push("discord");
+    if (ch.pushoverToken && ch.pushoverUser) channels.push("pushover");
+    if (!channels.length) return 0;
+    let sent = 0;
+    const cooldown = Math.max(0, Number(settings.detectors.edit.cooldownMin) || 0) * 60000;
+    for (const userID of Object.keys(store.pending)) {
+      if (!scanState.running) break;
+      const events = store.pending[userID];
+      if (!events.length) continue;
+      if (isWhitelisted(events[0].name)) { delete store.pending[userID]; persist(); continue; }
+      const last = store.lastSent[userID];
+      // Partially delivered events retry immediately, even during cooldown.
+      if (last && Date.now() - last < cooldown && !events.some((e) => e.delivered.length)) continue;
+      for (const channel of channels) {
+        const unsent = events.filter((e) => !e.delivered.includes(channel));
+        if (!unsent.length) continue;
+        const config = channel === "discord" ? { discordWebhook: ch.discordWebhook } : { ...ch, discordWebhook: "" };
+        const results = await sendNotification("edit", buildEditNotification(events[0].name, unsent), config);
+        if (results.includes(channel + ":ok")) {
+          unsent.forEach((e) => e.delivered.push(channel));
+          persist(); // do not resend a successful channel when the other fails
+        }
+      }
+      store.pending[userID] = events.filter((e) => !channels.every((c) => e.delivered.includes(c)));
+      if (store.pending[userID].length < events.length) { store.lastSent[userID] = Date.now(); sent++; }
+      if (!store.pending[userID].length) delete store.pending[userID];
+      persist();
+    }
+    return sent;
+  }
+
+  function makeEditDetector() {
+    const endpoint = editEndpoint();
+    const region = JSON.parse(JSON.stringify(settings.region));
+    // Full coordinates prevent region-hash collisions from sharing checkpoints.
+    const key = EDIT_STORAGE_PREFIX + endpoint.origin + endpoint.pathname + ":" + regionKey(region);
+    const coordinates = JSON.stringify(region.coordinates);
+    const raw = GM_getValue(key, null);
+    const store = raw ? (typeof raw === "string" ? JSON.parse(raw) : raw) : {
+      coordinates, baselineAt: null, checkpoints: {}, retry: {}, pending: {}, lastSent: {},
+    };
+    if (store.coordinates !== coordinates || !store.checkpoints || !store.retry || !store.pending || !store.lastSent) {
+      throw new Error("User edits storage is incompatible; checkpoint was not reset");
+    }
+    const persist = () => {
+      try { GM_setValue(key, JSON.stringify(store)); }
+      catch (e) {
+        const error = new Error("Could not persist User edits; scan stopped: " + e.message);
+        error.editStorageFailure = true;
+        throw error;
+      }
+    };
+    const collected = new Map();
+    let missingMetadata = 0;
+    return {
+      key: "edit",
+      collect() {
+        if (sdk.Editing.getUnsavedChangesCount() > 0) throw new Error("Save or undo local edits before scanning User edits");
+        for (const [type, module] of [["segment", sdk.DataModel.Segments], ["venue", sdk.DataModel.Venues]]) {
+          for (const object of module.getAll()) {
+            const id = String(object.id);
+            if (!id || id.startsWith("-")) continue;
+            const md = object.modificationData;
+            if (!md || !(md.updatedOn || md.createdOn)) { missingMetadata++; continue; }
+            const item = { type, id, time: editTime(md.updatedOn || md.createdOn) };
+            const objectKey = type + ":" + id;
+            // SDK merge events repeatedly expose the same loaded objects. Do
+            // the potentially expensive polygon intersection only for new versions.
+            if (collected.has(objectKey) && collected.get(objectKey).time >= item.time) continue;
+            if (!editGeometryInRegion(object.geometry, scanState.polygon)) continue;
+            item.bbox = geometryBbox(object.geometry); // for permalinks that land on and fit the object
+            if (!collected.has(objectKey) || collected.get(objectKey).time < item.time) collected.set(objectKey, item);
+          }
+        }
+      },
+      async finalize() {
+        if (store.baselineAt == null) {
+          for (const [id, item] of collected) store.checkpoints[id] = { time: item.time, ids: [], baseline: true };
+          store.baselineAt = scanState.startTime;
+          persist();
+          setEditStatus(`Baseline saved: ${collected.size} objects. Future changes will be reported.${missingMetadata ? " Some objects lack metadata." : ""}`);
+          return 0;
+        }
+        // Persist discovered work before fetching so failed/unloaded objects retry.
+        for (const [id, item] of collected) {
+          const checkpoint = store.checkpoints[id];
+          if ((!checkpoint || item.time > checkpoint.time) && (!store.retry[id] || item.time > store.retry[id].time)) store.retry[id] = item;
+        }
+        persist();
+        const budget = { remaining: 25 };
+        let failures = 0, processed = 0, lastError = "";
+        const total = Object.keys(store.retry).length;
+        for (const [id, item] of Object.entries(store.retry)) {
+          if (!scanState.running || budget.remaining <= 0) break;
+          setEditStatus(`Reading history: ${++processed}/${total} objects…`);
+          try {
+            const checkpoint = store.checkpoints[id] || { time: store.baselineAt, ids: [], baseline: true };
+            // An old object discovered later is silently baselined.
+            const result = item.time <= checkpoint.time ? { events: [], checkpoint } :
+              // Commit progress once per object (including paused/failed work),
+              // rather than stringifying the entire area store after every page.
+              await readNewEditEvents(endpoint, item, checkpoint, budget);
+            for (const event of result.events) {
+              noteUsername(event.name);
+              if (isWhitelisted(event.name)) continue;
+              const events = store.pending[event.userID] || (store.pending[event.userID] = []);
+              if (!events.some((e) => e.id === event.id && e.type === event.type && e.objectId === event.objectId)) events.push(event);
+            }
+            store.checkpoints[id] = result.checkpoint;
+            delete store.retry[id];
+            persist();
+          } catch (e) {
+            if (e.editStorageFailure) throw e;
+            failures++; lastError = e.message;
+            console.warn(`[WME Auto Scan] ${id}: ${e.message}`);
+            // Move a failing object to the end so it cannot starve the queue.
+            delete store.retry[id]; store.retry[id] = item;
+            persist();
+            if (/HTTP (401|403|429)|Unrecognized history/.test(e.message)) break;
+          }
+        }
+        const sent = await deliverEditEvents(store, persist);
+        const waiting = Object.values(store.pending).reduce((n, events) => n + events.length, 0);
+        setEditStatus(`${sent} user summaries sent; ${waiting} edits awaiting cooldown/delivery; ${Object.keys(store.retry).length} histories pending.${failures ? " " + lastError : ""}${missingMetadata ? " Some objects lack metadata." : ""}`);
+        return sent;
+      },
+    };
+  }
+
+  // ---------------------------------------------------------------------------
   // Scan engine
   // ---------------------------------------------------------------------------
   const scanState = {
@@ -1074,7 +1706,9 @@
   function activeDetectors() {
     const out = [];
     if (settings.detectors.closure.enabled) out.push(makeClosureDetector());
-    // Phase 2 detectors (edit/report/suggestion) are wired here later.
+    if (settings.detectors.report.enabled) out.push(makeReportDetector());
+    if (settings.detectors.suggestion.enabled) out.push(makeSuggestionDetector());
+    if (settings.detectors.edit.enabled) out.push(makeEditDetector());
     return out;
   }
 
@@ -1148,13 +1782,6 @@
     return !!a && !!b && a.cols === b.cols && a.rows === b.rows &&
       near(a.stepX, b.stepX) && near(a.stepY, b.stepY) &&
       near(a.minLon, b.minLon) && near(a.minLat, b.minLat);
-  }
-
-  // True if the current viewport (at scan time) is large enough to cover a cell
-  // built from `grid`; if the window shrank since optimizing, one center per cell
-  // would leave gaps, so we fall back to a full scan instead of missing area.
-  function viewportCoversGrid(grid, viewSize) {
-    return viewSize.w >= grid.stepX * 0.999 && viewSize.h >= grid.stepY * 0.999;
   }
 
   // Does the tile currently on the map hold any non-offroad segment inside `box`?
@@ -1302,16 +1929,14 @@
     return null;
   }
 
-  // Centers the recurring scan should visit: the productive subset if a complete,
-  // window-compatible mask exists; otherwise the full polygon-culled grid.
+  // A completed optimization is authoritative for every run. Only regions
+  // without a completed mask use a newly computed full grid.
   function scanCenters(region, polygon) {
-    const liveView = currentViewSize();
     const mask = loadMask(region);
-    if (mask && mask.complete && Array.isArray(mask.productive) && mask.productive.length &&
-        viewportCoversGrid(mask.grid, liveView)) {
+    if (mask && mask.complete && Array.isArray(mask.productive)) {
       return mask.productive.map((idx) => gridCellCenter(mask.grid, idx));
     }
-    const grid = computeGrid(polygon, liveView);
+    const grid = computeGrid(polygon, currentViewSize());
     return relevantCells(grid, polygon).map((idx) => gridCellCenter(grid, idx));
   }
 
@@ -1469,17 +2094,45 @@
     const originalCenter = sdk.Map.getMapCenter();
     const originalZoom = sdk.Map.getZoomLevel();
 
-    const detectors = activeDetectors();
+    let detectors;
+    try { detectors = activeDetectors(); }
+    catch (e) {
+      scanState.running = false;
+      setStatus("Could not start scan: " + e.message);
+      return;
+    }
     if (!detectors.length) {
       scanState.running = false;
       setStatus("Turn on at least one detector.");
       return;
     }
 
+    // Warn if the editor's Issue Tracker filters would starve a detector.
+    for (const [key, fn] of [["report", updateRequestsFilterWarning], ["suggestion", mapSuggestionsFilterWarning]]) {
+      if (!settings.detectors[key].enabled) continue;
+      const warn = fn();
+      if (warn) { console.warn("[WME Auto Scan] " + warn); setStatus(warn); }
+    }
+
+    let collectError = null;
+    const collect = () => {
+      for (const det of detectors) {
+        try { det.collect(); } catch (e) { collectError = e; }
+      }
+    };
+    const collectionEvents = ["wme-map-data-loaded", "wme-data-model-objects-added", "wme-data-model-objects-changed"];
+    let collecting = false;
+    const stopCollecting = () => {
+      if (!collecting) return;
+      for (const eventName of collectionEvents) sdk.Events.off({ eventName, eventHandler: collect });
+      collecting = false;
+    };
     try {
+      for (const eventName of collectionEvents) sdk.Events.on({ eventName, eventHandler: collect });
+      collecting = true;
       // Establish viewport size at scan zoom from the region centroid.
       const startCenter = centroidOfBbox(bboxOfCoords(scanState.polygon[0]));
-      await moveTo(startCenter, SCAN_ZOOM);
+      if (!await moveForScan(startCenter, collect)) return;
 
       const centers = scanCenters(settings.region, scanState.polygon);
       scanState.tilesTotal = centers.length;
@@ -1488,17 +2141,22 @@
       let finishedAllTiles = true;
       for (const center of centers) {
         if (!scanState.running) { finishedAllTiles = false; break; } // stopped mid-scan
-        await moveForScan(center);
-        for (const det of detectors) {
-          try { det.collect(); } catch (e) { console.error("[WME Auto Scan] collect error", e); }
-        }
+        if (!await moveForScan(center, collect)) { finishedAllTiles = false; break; }
+        collect();
+        if (collectError) throw collectError;
         scanState.tilesDone++;
       }
+
+      stopCollecting();
+      // A partial first pass must not turn later discoveries into new alerts.
+      if (!finishedAllTiles || !scanState.running) return;
+      if (collectError) throw collectError;
 
       // Finalize (build + send notifications, incl. screenshots which move map).
       for (const det of detectors) {
         try { await det.finalize(); } catch (e) {
           console.error("[WME Auto Scan] finalize error", e);
+          if (det.key === "edit") setEditStatus("User edits incomplete: " + e.message);
         }
       }
 
@@ -1511,6 +2169,7 @@
       console.error("[WME Auto Scan] scan failed", e);
       setStatus("Scan failed: " + e.message);
     } finally {
+      stopCollecting();
       // Restore the editor's original view.
       try {
         sdk.Map.setMapCenter({ lonLat: originalCenter, zoomLevel: originalZoom });
@@ -1907,10 +2566,34 @@
       const cb = el("input", { type: "checkbox" });
       cb.checked = d.enabled;
       if (!meta.phase1) cb.disabled = true;
-      cb.addEventListener("change", () => { d.enabled = cb.checked; saveSettings(); });
+      cb.addEventListener("change", () => { d.enabled = cb.checked; refreshUI(); saveSettings(); });
       row.appendChild(cb);
       row.appendChild(el("span", { text: meta.name + (meta.phase1 ? "" : " (soon)") }));
       sec.appendChild(row);
+
+      if (key === "edit" && d.enabled) {
+        sec.appendChild(el("div", { class: "was-muted", text: "Tracks segment/place history after a silent first scan. Uses the saved optimization when available, at the normal scan zoom. Counts cover loaded objects in scanned areas; deleted objects may be missed. Save local edits first.", style: "margin:2px 0 6px 24px" }));
+        const cooldown = el("input", { type: "number", min: "0", max: "1440", step: "1", value: String(d.cooldownMin) });
+        cooldown.addEventListener("change", () => {
+          d.cooldownMin = Math.min(1440, Math.max(0, Number(cooldown.value) || 0));
+          cooldown.value = String(d.cooldownMin);
+          saveSettings();
+        });
+        sec.appendChild(el("label", { class: "was-row" }, [el("span", { text: "Per-user cooldown (minutes; 0 = every scan)" }), cooldown]));
+        sec.appendChild(el("div", { class: "was-muted was-edit-status", text: editStatus, style: "margin:2px 0 6px 24px" }));
+      }
+
+      // Issue-Tracker-gated detectors (Update Requests, Map Suggestions) depend
+      // on WME's filter/group state, which the script can only read (not change)
+      // — surface that so a limited scan isn't a silent surprise.
+      const gate = DETECTOR_FILTER_GATES[key];
+      if (gate && d.enabled) {
+        const warn = gate.warn();
+        if (warn) {
+          sec.appendChild(el("div", { class: "was-muted", text: "⚠ " + warn, style: "margin:2px 0 6px 24px; color:#e67e22" }));
+        }
+        sec.appendChild(el("div", { class: "was-muted", text: gate.hint, style: "margin:2px 0 6px 24px" }));
+      }
     }
     return sec;
   }
@@ -2146,7 +2829,7 @@
   function buildWhitelistSection() {
     const sec = el("div", { class: "was-section" });
     sec.appendChild(el("h3", { text: "Whitelist" }));
-    sec.appendChild(el("div", { class: "was-muted", text: "Activity from these editors won't send notifications. You're always whitelisted.", style: "margin-bottom:6px" }));
+    sec.appendChild(el("div", { class: "was-muted", text: "Activity from these editors won't send notifications. You're added by default — remove yourself if you want alerts for your own edits.", style: "margin-bottom:6px" }));
 
     const chips = el("div");
     const renderChips = () => {
@@ -2206,9 +2889,22 @@
 
   const DETECTOR_META = {
     closure: { name: "Road closures", phase1: true },
-    edit: { name: "User edits", phase1: false },
-    report: { name: "Map issues", phase1: false },
-    suggestion: { name: "Map suggestions", phase1: false },
+    edit: { name: "User edits", phase1: true },
+    report: { name: "Update Requests", phase1: true },
+    suggestion: { name: "Map Suggestions", phase1: true },
+  };
+
+  // Detectors whose data WME only loads when a matching Issue Tracker group is
+  // enabled: pair each with its live filter warning + a persistent setup hint.
+  const DETECTOR_FILTER_GATES = {
+    report: {
+      warn: updateRequestsFilterWarning,
+      hint: "Requires the Update Requests group enabled in WME's Issue Tracker filter panel (status Both or Open); otherwise none load.",
+    },
+    suggestion: {
+      warn: mapSuggestionsFilterWarning,
+      hint: "Requires the Map Suggestions group enabled in WME's Issue Tracker filter panel (status Open or neutral); otherwise none load.",
+    },
   };
 
   // ---------------------------------------------------------------------------
@@ -2239,11 +2935,22 @@
       for (const rt of sdk.DataModel.Segments.getRoadTypes()) roadTypeNames[rt.id] = rt.localizedName || rt.name;
     } catch (e) {}
 
-    // Identify the current user (always whitelisted).
+    // Identify the current user and, on first load, whitelist them by default
+    // (removable — we only seed once, tracked by whitelistSeeded).
     try {
       const info = sdk.State.getUserInfo();
-      if (info && info.userName) { selfUserName = info.userName; noteUsername(info.userName); }
+      if (info && info.userName) {
+        selfUserName = info.userName;
+        noteUsername(info.userName);
+      }
     } catch (e) {}
+    if (!settings.whitelistSeeded) {
+      if (selfUserName && !settings.whitelist.some((w) => w.toLowerCase() === selfUserName.toLowerCase())) {
+        settings.whitelist.push(selfUserName);
+      }
+      settings.whitelistSeeded = true;
+      saveSettings();
+    }
 
     // Inject styles + sidebar tab.
     document.head.appendChild(el("style", { text: STYLE }));
