@@ -2418,8 +2418,9 @@
       background: var(--was-surface); padding: 6px 26px 6px 7px; cursor: pointer; }
     .was-hook.open { border-color: var(--was-accent); }
     .was-hook > input { border: none !important; background: transparent !important; padding: 2px 0 !important; cursor: text; }
-    .was-hook .chev { position: absolute; right: 8px; top: 7px; color: var(--was-muted); pointer-events: none;
-      transition: transform .15s; }
+    .was-hook .chev { position: absolute; right: 6px; top: 6px; display: flex; align-items: center; justify-content: center;
+      width: 18px; height: 18px; border-radius: 4px; background: var(--was-accent); color: #fff; font-size: 11px; line-height: 1;
+      pointer-events: none; transition: transform .15s; }
     .was-hook.open .chev { transform: rotate(180deg); }
     .was-hook-panel { display: none; margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--was-border); cursor: default; }
     .was-hook.open .was-hook-panel { display: block; }
@@ -2572,7 +2573,6 @@
       sec.appendChild(row);
 
       if (key === "edit" && d.enabled) {
-        sec.appendChild(el("div", { class: "was-muted", text: "Tracks segment/place history after a silent first scan. Uses the saved optimization when available, at the normal scan zoom. Counts cover loaded objects in scanned areas; deleted objects may be missed. Save local edits first.", style: "margin:2px 0 6px 24px" }));
         const cooldown = el("input", { type: "number", min: "0", max: "1440", step: "1", value: String(d.cooldownMin) });
         cooldown.addEventListener("change", () => {
           d.cooldownMin = Math.min(1440, Math.max(0, Number(cooldown.value) || 0));
@@ -2580,19 +2580,13 @@
           saveSettings();
         });
         sec.appendChild(el("label", { class: "was-row" }, [el("span", { text: "Per-user cooldown (minutes; 0 = every scan)" }), cooldown]));
-        sec.appendChild(el("div", { class: "was-muted was-edit-status", text: editStatus, style: "margin:2px 0 6px 24px" }));
       }
 
-      // Issue-Tracker-gated detectors (Update Requests, Map Suggestions) depend
-      // on WME's filter/group state, which the script can only read (not change)
-      // — surface that so a limited scan isn't a silent surprise.
-      const gate = DETECTOR_FILTER_GATES[key];
-      if (gate && d.enabled) {
-        const warn = gate.warn();
-        if (warn) {
-          sec.appendChild(el("div", { class: "was-muted", text: "⚠ " + warn, style: "margin:2px 0 6px 24px; color:#e67e22" }));
-        }
-        sec.appendChild(el("div", { class: "was-muted", text: gate.hint, style: "margin:2px 0 6px 24px" }));
+      // Issue-Tracker-gated detectors (Update Requests, Map Suggestions) only see
+      // whatever WME's filter/group state currently exposes, which the script can
+      // read but not change — warn so a limited scan isn't a silent surprise.
+      if (FILTER_GATED_DETECTORS.has(key) && d.enabled) {
+        sec.appendChild(el("div", { class: "was-muted", text: "⚠ Scan can only see your current filters, it's recommended to remove all filters.", style: "margin:2px 0 6px 24px; color:#e67e22" }));
       }
     }
     return sec;
@@ -2623,7 +2617,7 @@
     if (regionMethod === "managed") sec.appendChild(buildManagedAreaPicker());
     else if (regionMethod === "search") sec.appendChild(buildPlaceSearch());
     else if (regionMethod === "draw") {
-      const drawBtn = el("button", { class: "was-btn secondary", text: regionDraft ? "Redraw area" : "Draw area on map", onclick: drawRegionDraft });
+      const drawBtn = el("button", { class: "was-btn secondary", title: "Draw a custom scan area directly on the map", text: regionDraft ? "Redraw area" : "Draw area on map", onclick: drawRegionDraft });
       sec.appendChild(el("div", { class: "was-btns", style: "margin-bottom:6px" }, [drawBtn]));
     }
 
@@ -2633,6 +2627,7 @@
     }
     const saveBtn = el("button", {
       class: "was-btn go",
+      title: "Save the selected area as your scan region",
       text: "Save",
       onclick: () => {
         if (!regionDraft) return;
@@ -2669,7 +2664,7 @@
   function buildPlaceSearch() {
     const wrap = el("div");
     const searchInput = el("input", { type: "text", placeholder: "Search for a place…" });
-    const searchBtn = el("button", { class: "was-btn secondary", text: "Search" });
+    const searchBtn = el("button", { class: "was-btn secondary", title: "Search for a place to use as your scan region", text: "Search" });
     const results = el("div", { class: "was-search-results" });
     const doSearch = async () => {
       const q = searchInput.value.trim();
@@ -2711,6 +2706,7 @@
       const btnLabel = optimized ? "Re-optimize" : (resuming ? "Resume optimizing" : "Optimize");
       const optBtn = el("button", {
         class: "was-btn " + (optimized ? "secondary" : "go"),
+        title: "Map which tiles contain roads so scans skip empty areas and finish faster",
         text: btnLabel,
         onclick: () => {
           // Re-optimizing a region that's already done throws away a good mask,
@@ -2733,7 +2729,7 @@
       btns.appendChild(pill);
 
       if (mask) {
-        const clearBtn = el("button", { class: "was-btn secondary", text: "Clear", onclick: () => { clearMask(settings.region); refreshUI(); } });
+        const clearBtn = el("button", { class: "was-btn secondary", title: "Discard the saved optimization for this region", text: "Clear", onclick: () => { clearMask(settings.region); refreshUI(); } });
         if (scanState.running) clearBtn.disabled = true;
         btns.appendChild(clearBtn);
       }
@@ -2829,14 +2825,13 @@
   function buildWhitelistSection() {
     const sec = el("div", { class: "was-section" });
     sec.appendChild(el("h3", { text: "Whitelist" }));
-    sec.appendChild(el("div", { class: "was-muted", text: "Activity from these editors won't send notifications. You're added by default — remove yourself if you want alerts for your own edits.", style: "margin-bottom:6px" }));
 
     const chips = el("div");
     const renderChips = () => {
       chips.innerHTML = "";
       for (const name of settings.whitelist) {
         const chip = el("span", { class: "was-chip", text: name });
-        chip.appendChild(el("button", { text: "×", onclick: () => { settings.whitelist = settings.whitelist.filter((n) => n !== name); saveSettings(); renderChips(); } }));
+        chip.appendChild(el("button", { title: "Remove from whitelist", text: "×", onclick: () => { settings.whitelist = settings.whitelist.filter((n) => n !== name); saveSettings(); renderChips(); } }));
         chips.appendChild(chip);
       }
     };
@@ -2865,7 +2860,7 @@
 
     // Auto-fill: pull the editors visible in the current map view.
     const found = el("div", { class: "was-search-results" });
-    const scanBtn = el("button", { class: "was-btn secondary", text: "Find editors in view" });
+    const scanBtn = el("button", { class: "was-btn secondary", title: "List editors currently visible in the map view to whitelist", text: "Find editors in view" });
     scanBtn.addEventListener("click", () => {
       const names = scrapeAreaUsernames().sort((a, b) => a.localeCompare(b));
       fillDatalist(names);
@@ -2894,18 +2889,9 @@
     suggestion: { name: "Map Suggestions", phase1: true },
   };
 
-  // Detectors whose data WME only loads when a matching Issue Tracker group is
-  // enabled: pair each with its live filter warning + a persistent setup hint.
-  const DETECTOR_FILTER_GATES = {
-    report: {
-      warn: updateRequestsFilterWarning,
-      hint: "Requires the Update Requests group enabled in WME's Issue Tracker filter panel (status Both or Open); otherwise none load.",
-    },
-    suggestion: {
-      warn: mapSuggestionsFilterWarning,
-      hint: "Requires the Map Suggestions group enabled in WME's Issue Tracker filter panel (status Open or neutral); otherwise none load.",
-    },
-  };
+  // Detectors whose data WME only loads through the Issue Tracker, so a scan
+  // sees only what the editor's current filters expose.
+  const FILTER_GATED_DETECTORS = new Set(["report", "suggestion"]);
 
   // ---------------------------------------------------------------------------
   // Bootstrap
