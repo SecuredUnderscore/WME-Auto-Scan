@@ -1,8 +1,8 @@
-# WME Auto Scan
+# WME Auto Scan (Beta)
 
-A customizable, passive background scanner for the [Waze Map Editor](https://www.waze.com/editor). Select an area, click **Run**, and the script monitors it on a timer—sending **Discord** and/or **Pushover** notifications whenever it detects new road closures, user edits, Update Requests (URs), or Map Suggestions.
+Have you ever entered the map editor without a plan? Blindly panning around the map to find issues to solve. Sometimes realizing your 10 hours late to a road closure. No more! Get a notification when something actionable happens. Road Closure report, new Update Request, and more.
 
-WME Auto Scan runs directly in your browser via the official WME SDK.
+WME Auto Scan uses the official WME SDK (For now...).
 
 **[Install on Greasy Fork](https://greasyfork.org/en/scripts/595728-wme-auto-scan)** · **[Source & issues on GitHub](https://github.com/SecuredUnderscore/WME-Auto-Scan)**
 
@@ -10,14 +10,13 @@ WME Auto Scan runs directly in your browser via the official WME SDK.
 
 ## Features
 
-- **Independent Detectors** — Toggle and configure each scan type separately:
+- **Independent Detectors** — Toggle and configure each scan type:
   - **Road closures**
   - **User edits** — Edits by other editors.
   - **Update Requests (URs)**
   - **Map Suggestions**
 - **Flexible Region Selection** — Choose an area from your **managed areas**, **search for a place** (city, county, country via OpenStreetMap), or **draw a polygon** directly on the map.
 - **Tile Mask Optimization** — Perform a one-time scan to map road-bearing tiles. Subsequent scans skip water and empty land speeding up cycles.
-- **Reliable Loading** — Each area is scanned only after WME confirms its data has loaded; failed loads are retried, so nothing is skipped.
 - **Editor Whitelist** — Ignore events from specific editors.
 
 ---
