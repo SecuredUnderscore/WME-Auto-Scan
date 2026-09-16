@@ -17,6 +17,7 @@ WME Auto Scan runs directly in your browser via the official WME SDK.
   - **Map Suggestions**
 - **Flexible Region Selection** — Choose an area from your **managed areas**, **search for a place** (city, county, country via OpenStreetMap), or **draw a polygon** directly on the map.
 - **Tile Mask Optimization** — Perform a one-time scan to map road-bearing tiles. Subsequent scans skip water and empty land speeding up cycles.
+- **Reliable Loading** — Each area is scanned only after WME confirms its data has loaded; failed loads are retried, so nothing is skipped.
 - **Editor Whitelist** — Ignore events from specific editors.
 
 ---
@@ -49,10 +50,12 @@ Open the **Auto Scan** tab in the sidebar to access **Settings** and **Run** mod
 #### Optimization (Recommended)
 - Click **Optimize** to map and save active road tiles.
 - Optimization is resumable if interrupted and prompts for a refresh after 30 days.
+- Optimizations made before v0.2.0 are discarded—run **Optimize** once after updating.
 - Click 👁 next to Optimize to preview scanned tiles.
 
 #### General Settings
 - **Scan interval** — Set the delay between scans in minutes (also displays the duration of the last scan).
+- **Don't scan places** — Skip loading places for much faster scans. Edits to places won't be reported.
 - **Discord** — Enter your webhook URL. Click ▾ to expand per-detector overrides.
 - **Pushover** — Enter your User Key, API Token, and alert sound (supports per-detector overrides).
 - **Whitelist** — Add usernames to ignore. Click **Find editors in view** to quickly populate names from the current map view.
@@ -63,7 +66,9 @@ Open the **Auto Scan** tab in the sidebar to access **Settings** and **Run** mod
 2. Click **Run** to start scanning. The status bar shows live progress and a countdown to the next cycle.
 3. Click **Stop** at any time to halt the loop.
 
-> ⚠️ **Update Requests & Map Suggestions:** These are read through WME's Issue Tracker, so a scan only sees what your **current map filters** allow. For complete results, clear all filters before scanning.
+While scanning, the script shows only the map layers your detectors need and restores your layers when it's done.
+
+> ⚠️ **Update Requests & Map Suggestions:** These are read through WME's Issue Tracker, so a scan only sees what your **current map filters** allow. For complete results, clear all filters before scanning. If a group is turned off in the filters, that detector is skipped for the scan.
 
 ## License
 
