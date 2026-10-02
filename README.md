@@ -16,7 +16,6 @@ WME Auto Scan reads map data straight from WME's own map service, using your log
   - **Update Requests (URs)**
   - **Map Suggestions**
 - **Flexible Region Selection** — Choose an area from your **managed areas**, **search for a place** (city, county, country via OpenStreetMap), or **draw a polygon** directly on the map.
-- **Fast, hands-off scanning** — Several areas are requested at once, sized to what the map service returns completely. Your map, layers and selection are left alone.
 - **Editor Whitelist** — Ignore events from specific editors.
 
 ---
