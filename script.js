@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME Auto Scan
 // @namespace    https://github.com/SecuredUnderscore/WME-Auto-Scan
-// @version      0.3.0
+// @version      0.4.0
 // @description  Scans a selected area in Waze Map Editor for road closures, user edits, update requests, and map suggestions, and sends notifications to Discord or Pushover.
 // @author       SecuredUnderscore
 // @match        https://www.waze.com/editor*
@@ -35,43 +35,36 @@
   // ---------------------------------------------------------------------------
   const SCRIPT_ID = "wme-auto-scan";
   const SCRIPT_NAME = "WME Auto Scan";
-  const SCRIPT_VERSION = "0.3.0"; // keep in sync with @version above
+  const SCRIPT_VERSION = "0.4.0"; // keep in sync with @version above
   const STORAGE_KEY = "wme-auto-scan:settings:v1";
-  const ROADS_ZOOM = 15; // closures + user edits: segments, closures and places load here
-  const ISSUES_ZOOM = 12; // Update Requests + Map Suggestions: WME's Issue Tracker minimum
-  const MAX_SPLIT_ZOOM = 17; // deepest zoom a busy Issue Tracker tile is split to
-  // A capped Issue Tracker response holds exactly the cap, so if any tile in a
-  // pass was capped, the cap is the largest count in that pass. Verifying just
-  // the busiest tile therefore settles the whole pass (see probeForCap) — a busy
-  // tile alone means nothing: Vancouver Island returns 91-378 suggestions per
-  // zoom-12 tile, capped at none of them. ISSUE_SPLIT_AT only splits on sight a
-  // response so large it is almost certainly truncated.
-  const ISSUE_SPLIT_AT = 1000;
-  const ISSUE_PROBE_MIN = 50; // smallest count worth verifying as a possible cap
-  const TILE_MARGIN = 0.97; // grid step as a fraction of the box WME loads per visit
-  const MAX_SPLIT_DEPTH = 4; // quarterings of one cell when WME's box doesn't cover it
-  const REQUEST_TIMEOUT_MS = 30000; // a WME request stuck this long is abandoned and retried
-  const MAX_TILE_RETRIES = 5; // failed loads of one tile before the scan stops
-  const RETRY_BASE_MS = 250; // backoff after a failed load: 1 s, 2 s, 4 s…
 
-  // --- Optimization "tile mask" -------------------------------------------
-  // A one-time pass records which grid cells contain a real (non-offroad) road
-  // network; recurring scans then visit only those cells, skipping ocean and
-  // roadless wilderness. Every visit is loaded exactly (see createLoadTracker),
-  // and a cell a neighbouring response already showed a road in is not visited.
-  const OFFROAD_ROAD_TYPES = new Set([8]); // roadType ids that don't count as "has roads"
-  const MASK_STORAGE_PREFIX = "wme-auto-scan:mask:v2:"; // v1 masks used a lat/lon grid and timed loads
-  const MASK_STALE_DAYS = 30; // suggest re-optimizing once a mask is older than this
-  const OPTIMIZE_SAVE_EVERY = 25; // persist optimize progress every N cells (resumable)
-  const BOX_RATIO_KEY = "wme-auto-scan:box-ratio:v1"; // measured request box ÷ viewport, for previews
+  // --- Map API scanning ----------------------------------------------------
+  // Scans read WME's own map-data endpoint (Descartes "Features") directly, one
+  // bounding box per request, instead of panning the map. Tile sizes come from
+  // live tests (2026-10-01, Victoria BC). Both limits are silent — the server
+  // still answers 200 — so every pass stays below its limit:
+  //  - past ~0.09° per side the server drops minor road types (streets, parking
+  //    lots, private roads) from the reply;
+  //  - closures-only replies are complete at 1° but come back empty at 2°.
+  const CLOSURE_TILE_DEG = 1;
+  const CLOSURE_MIN_TILE_DEG = 0.25; // never split below this, whatever a reply looks like
+  const ROAD_TILE_DEG = 0.07; // margin under 0.09° whether the limit is degrees, km or area
+  const MAX_PARALLEL = 3; // 6 requests: 1.7 s one at a time, 0.57 s three at a time, no refusals
+  const REQUEST_TIMEOUT_MS = 30000; // a request stuck this long is abandoned and retried
+  const MAX_RETRIES = 5; // failed attempts at one request before the scan stops
+  const RETRY_BASE_MS = 1000; // backoff after a failed request: 1 s, 2 s, 4 s…
+  const RATE_PAUSE_MS = 1000; // pause after a 429; doubles while refusals continue
+  const RATE_PAUSE_MAX_MS = 30000;
+  const RATE_GIVE_UP_MS = 300000; // stop the scan after this long spent waiting out refusals
+  const API_BASES = { usa: "/Descartes/app", row: "/row-Descartes/app", il: "/il-Descartes/app" };
   const PROFILE_URL = (u) => `https://www.waze.com/user/editor/${encodeURIComponent(u)}`;
 
   // Map overlay layers used by the "eye" preview buttons (region outline / the
-  // per-tile scan boxes). Drawn on demand and cleared as soon as the zoom
+  // scan's request boxes). Drawn on demand and cleared as soon as the zoom
   // changes or the user toggles a preview off.
   const REGION_PREVIEW_LAYER = "wme-auto-scan-region-preview";
   const BBOX_PREVIEW_LAYER = "wme-auto-scan-bbox-preview";
-  const MAX_PREVIEW_BOXES = 5000; // cap so a huge unoptimized region can't stall the map
+  const MAX_PREVIEW_BOXES = 5000; // cap so a huge region can't stall the map
 
   // Discord embed colours, one per detector type.
   const COLORS = {
@@ -88,6 +81,7 @@
     10: "Pedestrian Boardwalk", 15: "Ferry", 16: "Stairway", 17: "Private Road",
     18: "Railroad", 19: "Runway/Taxiway", 20: "Parking Lot Road", 22: "Alley",
   };
+  const ALL_ROAD_TYPES = Object.keys(ROAD_TYPE_FALLBACK).map(Number);
 
   // ---------------------------------------------------------------------------
   // Settings model + persistence (GM storage)
@@ -117,7 +111,7 @@
         closure: { ...detector(), enabled: true },
         edit: { ...detector(), cooldownMin: 60 },
         report: detector(),
-        suggestion: detector(),
+        suggestion: { ...detector(), includeSegments: true }, // also alert on new-road suggestions
       },
     };
   }
@@ -162,6 +156,16 @@
 
   function sleep(ms) {
     return new Promise((r) => setTimeout(r, ms));
+  }
+
+  // One macrotask, via MessageChannel: unlike setTimeout it isn't throttled to
+  // once a second when the WME tab is in the background.
+  function yieldToPage() {
+    return new Promise((resolve) => {
+      const channel = new MessageChannel();
+      channel.port1.onmessage = () => { channel.port1.close(); resolve(); };
+      channel.port2.postMessage(null);
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -229,6 +233,79 @@
       }
     }
     return false;
+  }
+
+  // --- Region index ---------------------------------------------------------
+  // A scan tests thousands of objects per request against the region outline,
+  // and plain ray casting walks every outline edge for every point — enough to
+  // freeze the page on a detailed coastline. Bucketing the edges into
+  // horizontal bands means a point only meets the few edges in its band; the
+  // answers are exactly those of pointInPolygon / lineInPolygon (same ray, same
+  // edges crossed), just found without the full walk.
+  const INDEX_BANDS = 2048;
+  function indexPolygon(poly) {
+    const edges = []; // [xj, yj, xi, yi, ring] — the (j, i) vertex pairs pointInPolygon visits
+    for (let r = 0; r < poly.length; r++) {
+      const ring = poly[r] || [];
+      for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) edges.push([ring[j][0], ring[j][1], ring[i][0], ring[i][1], r]);
+    }
+    let minY = Infinity, maxY = -Infinity;
+    for (const e of edges) {
+      minY = Math.min(minY, e[1], e[3]);
+      maxY = Math.max(maxY, e[1], e[3]);
+    }
+    const n = Math.max(1, Math.min(INDEX_BANDS, edges.length));
+    const h = (maxY - minY) / n || 1;
+    const bandOf = (y) => Math.min(n - 1, Math.max(0, Math.floor((y - minY) / h)));
+    const bands = Array.from({ length: n }, () => []);
+    edges.forEach((e, k) => {
+      for (let b = bandOf(Math.min(e[1], e[3])), last = bandOf(Math.max(e[1], e[3])); b <= last; b++) bands[b].push(k);
+    });
+    const parity = new Uint8Array(poly.length);
+    const stamp = new Int32Array(edges.length);
+    let tick = 0;
+    const firstPoint = (poly[0] && poly[0][0]) || [NaN, NaN];
+
+    function pointIn(pt) {
+      if (!(pt[1] >= minY && pt[1] <= maxY)) return false;
+      parity.fill(0);
+      for (const k of bands[bandOf(pt[1])]) {
+        const e = edges[k];
+        const xj = e[0], yj = e[1], xi = e[2], yi = e[3];
+        if (yi > pt[1] !== yj > pt[1] && pt[0] < ((xj - xi) * (pt[1] - yi)) / (yj - yi) + xi) parity[e[4]] ^= 1;
+      }
+      if (!parity[0]) return false;
+      for (let r = 1; r < parity.length; r++) if (parity[r]) return false; // inside a hole
+      return true;
+    }
+
+    // Any vertex inside, or any segment crossing the outer boundary.
+    function lineIn(coords) {
+      for (const c of coords) if (pointIn(c)) return true;
+      for (let k = 0; k < coords.length - 1; k++) {
+        const a = coords[k], b = coords[k + 1];
+        const lo = Math.min(a[1], b[1]), hi = Math.max(a[1], b[1]);
+        if (hi < minY || lo > maxY) continue;
+        tick++;
+        for (let band = bandOf(lo), last = bandOf(hi); band <= last; band++) {
+          for (const i of bands[band]) {
+            if (stamp[i] === tick) continue;
+            stamp[i] = tick;
+            const e = edges[i];
+            if (e[4] === 0 && segsIntersect(a, b, [e[0], e[1]], [e[2], e[3]])) return true;
+          }
+        }
+      }
+      return false;
+    }
+
+    // Does a [w, s, e, n] box overlap the region? (bboxInPolygon, indexed)
+    function boxIn(box) {
+      const [w, s, e, nn] = box;
+      return lineIn([[w, s], [e, s], [e, nn], [w, nn], [w, s]]) || pointInBox(firstPoint, box);
+    }
+
+    return { pointIn, lineIn, boxIn, firstPoint };
   }
 
   function centroidOfBbox(bbox) {
@@ -437,388 +514,217 @@
   }
 
   // ---------------------------------------------------------------------------
-  // SDK-backed map utilities
+  // WME map API client
   // ---------------------------------------------------------------------------
+  // Scan data comes from read-only GETs to WME's own same-origin endpoints, sent
+  // with the editor's session cookie — the same requests WME makes to draw the
+  // map. Nothing is written, and the map itself is never moved, so the editor can
+  // keep working while a scan runs.
   let sdk = null;
   let roadTypeNames = {}; // id -> localized name
 
-  // --- Web Mercator helpers ------------------------------------------------
-  // At a fixed zoom the viewport (and every box WME requests) has the same size
-  // in Mercator units anywhere on the map, so tile grids are laid out in
-  // lon × Mercator-Y. A plain lat/lon grid would leave gaps toward the poles.
-  const RAD = Math.PI / 180;
-  function mercY(lat) {
-    return Math.log(Math.tan(Math.PI / 4 + (lat * RAD) / 2)) / RAD;
-  }
-  function latOfMercY(y) {
-    return (2 * Math.atan(Math.exp(y * RAD)) - Math.PI / 2) / RAD;
-  }
-  // Width/height of a [minLon, minLat, maxLon, maxLat] box in Mercator units.
-  function mercSpan(box) {
-    return { w: box[2] - box[0], h: mercY(box[3]) - mercY(box[1]) };
-  }
-  function boxContains(outer, inner) {
-    return outer[0] <= inner[0] && outer[1] <= inner[1] && outer[2] >= inner[2] && outer[3] >= inner[3];
-  }
-
-  // --- Exact map-load tracking ---------------------------------------------
-  // EXPLICIT SDK-ONLY EXCEPTION — authorized by the user on 2026-09-06 (WME's
-  // loading flags) and widened on 2026-09-13 to read-only load tracking, ONLY
-  // for detecting map-load completion. The SDK can't tell a finished tile from
-  // a failed or superseded request, so we observe the performance marks WME
-  // itself writes around each map-data request:
-  //   wme_mark_request_features_and_render_{start,end}$<uuid>  roads, closures,
-  //     places — the end mark is written after the response is merged
-  //   wme_mark_request_issues_map_{start,end}$<uuid>  Issue Tracker bbox search
-  //     (Update Requests, Map Suggestions) — merged before observers run
-  // End marks carry the request's status, bbox and zoom. This is a standard
-  // PerformanceObserver: we never patch WME, call its endpoints, or initiate
-  // requests, and all scan data still comes from the SDK data model. WME starts
-  // both requests synchronously inside the map move, so there is nothing to time.
-  // If WME stops writing these marks the scan fails instead of guessing.
-  const REQUEST_MARK = /^wme_mark_(request_features_and_render|request_issues_map)_(start|end)\$(.+)$/;
-  const MARK_KIND = { request_features_and_render: "features", request_issues_map: "issues" };
-  const NUDGE_DEG = 1e-6; // re-centering offset that makes WME request a tile again
-  const NO_LOAD_MESSAGES = {
-    features: "WME didn't load road data for part of the area. Scan stopped; baseline was not updated.",
-    issues: "WME didn't search the Issue Tracker for part of the area. Make sure the Issue Tracker layer is on.",
+  // The WME SDK runs in async mode (opt-in now, the only mode from 2027-01-01):
+  // every module method returns a Promise. Each call is awaited, which works in
+  // the old sync mode too. The few facts that synchronous code (request URLs,
+  // link building) needs are cached here and refreshed before every scan.
+  const wme = {
+    regionCode: null,
+    permalink: "https://www.waze.com/editor",
+    viewport: { w: 1200, h: 800 },
   };
+  async function refreshWmeInfo() {
+    try { wme.regionCode = await sdk.Settings.getRegionCode(); } catch (e) {}
+    try { wme.permalink = (await sdk.Map.getPermalink()) || wme.permalink; } catch (e) {}
+    try {
+      const el = await sdk.Map.getMapViewportElement();
+      if (el && el.clientWidth && el.clientHeight) wme.viewport = { w: el.clientWidth, h: el.clientHeight };
+    } catch (e) {}
+  }
 
-  // --- Rate-limit watch ----------------------------------------------------
-  // Waze's edge (Google Frontend) answers bursts with "429 Too Many Requests",
-  // with no Retry-After and an HTML body, and typically refuses everything for a
-  // ban window once tripped — so pacing during one is pointless and the whole
-  // scan has to wait. WME discards the status code, so we read it from resource
-  // timing: the browser's own record of requests the page already made. Passive,
-  // like the marks above: no patching, no requests of our own.
-  // Only map-data endpoints matter: WME's telemetry exporter (otlp-traces) is
-  // throttled far sooner than the data paths and refusing it costs the scan
-  // nothing, so pausing for those refusals would stall a healthy scan.
-  const DATA_REQUESTS = /Descartes\/app\/Features|Descartes\/app\/v1\/Issues|MapEditorWebServer\/search/;
-  // A lone 429 is a burst the retry rides out (WME serves the retried request
-  // and caches it), so it costs nothing to ignore. Only back-to-back refusals
-  // with no successful data response between them mean the door is actually shut.
-  const RATE_COOLDOWN_MS = 1000; // pause once two refusals come in a row; doubles from there
-  const RATE_COOLDOWN_MAX_MS = 30000;
-  // Sustained partial refusals (WME kept refusing ~40% of requests while serving
-  // the rest) mean the limiter wants a lower rate, not a pause: the gap between
-  // map moves rises with the recent refusal rate and falls back to nothing as
-  // soon as requests are being served again.
-  const RATE_SAMPLE = 20; // requests per endpoint the refusal rate is measured over
-  const RATE_MAX_GAP_MS = 5000;
-  const RATE_GIVE_UP_MS = 300000; // give up on a tile after this long spent waiting out refusals
+  function apiBase() {
+    const base = API_BASES[wme.regionCode];
+    if (!base) throw new Error("Unknown WME server region");
+    return PAGE.location.origin + base;
+  }
 
-  function createRateWatcher(perf, Observer) {
-    let cooldownUntil = 0, streak = 0;
-    const recent = new Map(); // endpoint -> last RATE_SAMPLE outcomes (true when refused)
-    let lastRefusalAt = -Infinity, observer = null;
+  function stoppedError() {
+    const e = new Error("Scan stopped.");
+    e.stopped = true;
+    return e;
+  }
 
-    function record(entry) {
-      const status = Number(entry.responseStatus || 0);
-      if (!status || !DATA_REQUESTS.test(entry.name)) return;
-      let path = entry.name;
-      try {
-        const url = new URL(entry.name);
-        path = url.host + url.pathname.split("/").slice(0, 5).join("/");
-      } catch (e) {}
-      // Tracked per endpoint: the searches are almost never refused and would
-      // otherwise hide how hard Features and Issues are being throttled.
-      const outcomes = recent.get(path) || [];
-      outcomes.push(status === 429);
-      if (outcomes.length > RATE_SAMPLE) outcomes.shift();
-      recent.set(path, outcomes);
-      if (status !== 429) {
-        if (status < 400) streak = 0; // the door is open again
-        return;
+  // Failed requests retry with backoff. A 429 (Waze's edge refusing a burst)
+  // pauses every request of the scan, doubling while refusals continue, since
+  // the limiter typically shuts the door for a while once tripped.
+  function createApiClient(isStopped) {
+    const controllers = new Set();
+    let pauseUntil = 0, refusals = 0;
+
+    async function waitOutPause() {
+      for (let left = pauseUntil - Date.now(); left > 0; left = pauseUntil - Date.now()) {
+        if (isStopped()) throw stoppedError();
+        await sleep(Math.min(left, 500));
       }
-      streak++;
-      lastRefusalAt = perf.now();
-      // The first refusal is left to the tile's own retry; only a run of them pauses.
-      const pause = streak < 2 ? 0 : Math.min(RATE_COOLDOWN_MAX_MS, RATE_COOLDOWN_MS * 2 ** (streak - 2));
-      if (!pause) return;
-      cooldownUntil = Math.max(cooldownUntil, lastRefusalAt + pause);
-      console.warn(`[WME Auto Scan] WME refused ${streak} map-data requests in a row on ${path}. Pausing ${(pause / 1000).toFixed(1)}s.`);
     }
 
-    try {
-      observer = new Observer((list) => { const entries = list.getEntries(); for (let i = 0; i < entries.length; i++) record(entries[i]); });
-      observer.observe({ type: "resource", buffered: false });
-    } catch (e) { observer = null; }
+    async function get(path, params) {
+      const url = new URL(apiBase() + "/" + path);
+      for (const [k, v] of Object.entries(params)) {
+        if (v != null) url.searchParams.set(k, Array.isArray(v) ? v.join(",") : String(v));
+      }
+      let failures = 0, limitedSince = null;
+      for (;;) {
+        if (isStopped()) throw stoppedError();
+        await waitOutPause();
+        const controller = new AbortController();
+        controllers.add(controller);
+        const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+        let status = 0, body = null, problem = null;
+        try {
+          const res = await fetch(url.href, { credentials: "same-origin", signal: controller.signal });
+          status = res.status;
+          if (res.ok) {
+            try { body = await res.json(); } catch (e) { problem = "unreadable response"; }
+          }
+        } catch (e) {
+          problem = controller.signal.aborted ? "timeout" : "network error";
+        } finally {
+          clearTimeout(timer);
+          controllers.delete(controller);
+        }
+        if (isStopped()) throw stoppedError();
+        if (body && typeof body === "object") { refusals = 0; return body; }
+        if (status === 429) {
+          limitedSince = limitedSince || Date.now();
+          if (Date.now() - limitedSince > RATE_GIVE_UP_MS) {
+            throw new Error("WME is rate limiting this session (429 Too Many Requests). Scan stopped; baseline was not updated.");
+          }
+          refusals++;
+          const pause = Math.min(RATE_PAUSE_MAX_MS, RATE_PAUSE_MS * 2 ** Math.min(refusals - 1, 10));
+          if (refusals > 1) console.warn(`[WME Auto Scan] WME refused ${refusals} requests in a row. Pausing ${(pause / 1000).toFixed(1)}s.`);
+          pauseUntil = Math.max(pauseUntil, Date.now() + pause);
+          continue;
+        }
+        if (status === 401 || status === 403) {
+          throw new Error(`WME refused the map request (HTTP ${status}). Make sure you're logged in. Scan stopped; baseline was not updated.`);
+        }
+        if (++failures > MAX_RETRIES) {
+          throw new Error(`WME kept failing to return map data (${problem || "HTTP " + status}). Scan stopped; baseline was not updated.`);
+        }
+        await sleep(RETRY_BASE_MS * 2 ** (failures - 1));
+      }
+    }
 
     return {
-      // Sit out a rate-limit pause; resolves the milliseconds waited, or null if
-      // the run was stopped.
-      async clearance(isStopped) {
-        const from = perf.now();
-        for (let left = cooldownUntil - perf.now(); left > 0; left = cooldownUntil - perf.now()) {
-          if (isStopped()) return null;
-          await sleep(Math.min(left, 500));
-        }
-        return isStopped() ? null : perf.now() - from;
+      // One Features request for bbox [minLon, minLat, maxLon, maxLat].
+      features(bbox, params) {
+        return get("Features", { bbox: bbox.map((v) => +v.toFixed(6)).join(","), language: "en", v: 2, ...params });
       },
-      refusedSince: (t) => lastRefusalAt >= t,
-      // Minimum spacing between map moves for the refusal rate we're seeing.
-      gap() {
-        let worst = 0;
-        for (const outcomes of recent.values()) {
-          if (outcomes.length < 8) continue;
-          worst = Math.max(worst, outcomes.filter(Boolean).length / outcomes.length);
-        }
-        return worst <= 0.05 ? 0 : Math.min(RATE_MAX_GAP_MS, Math.round(worst * 10) * 500);
-      },
-      disconnect() {
-        if (observer) observer.disconnect();
-      },
+      abort() { for (const c of controllers) c.abort(); },
     };
   }
 
-  function markBox(b) {
-    if (!b) return null;
-    const box = (b.left != null ? [b.left, b.bottom, b.right, b.top] : [b[0], b[1], b[2], b[3]]).map(Number);
-    return box.every(Number.isFinite) ? box : null;
+  // id -> userName from a reply's users collection (closure reporters, editors).
+  function userNames(reply) {
+    const names = new Map();
+    for (const u of (reply && reply.users && reply.users.objects) || []) {
+      if (u && u.id != null && u.userName) {
+        names.set(u.id, u.userName);
+        noteUsername(u.userName);
+      }
+    }
+    return names;
   }
 
-  function createLoadTracker(isStopped) {
-    const perf = window.performance;
-    const Observer = window.PerformanceObserver;
-    if (!perf || typeof perf.getEntriesByType !== "function" || typeof Observer !== "function") {
-      throw new Error("WME load tracking is unavailable in this browser. Scan stopped; baseline was not updated.");
-    }
-    const rate = createRateWatcher(perf, Observer);
-    let lastMoveAt = -Infinity;
-    const requests = new Map(); // uuid -> request record
-    let sawRequestMark = false;
-    let wake = null;
-    const lateMergeAt = { features: -Infinity, issues: -Infinity };
-
-    function record(entry) {
-      const m = REQUEST_MARK.exec(entry.name);
-      if (!m) return;
-      sawRequestMark = true;
-      let req = requests.get(m[3]);
-      if (!req) {
-        req = { kind: MARK_KIND[m[1]], startedAt: entry.startTime, endedAt: null, status: null };
-        requests.set(m[3], req);
-      }
-      if (m[2] === "start") {
-        req.startedAt = entry.startTime;
-        return;
-      }
-      const detail = entry.detail || {};
-      if (req.endedAt != null) {
-        // A request we abandoned finished after all; if it succeeded, WME merged
-        // its stale response over whatever the scan has loaded since.
-        if (req.status === "timeout" && detail.status === "success") lateMergeAt[req.kind] = entry.startTime;
-        return;
-      }
-      const params = detail.requestParams || {};
-      req.endedAt = entry.startTime;
-      req.status = detail.status;
-      req.box = markBox(req.kind === "features" ? params.bounds : params.bbox);
-      req.zoom = Number(detail.zoomLevel != null ? detail.zoomLevel : params.zoomLevel);
-      req.counts = detail.itemsCount || null;
-      req.hasUpdateRequests = !!params.mapUpdateRequestsFilter;
-      req.hasSuggestions = !!params.mapSuggestionsFilter;
-      // Groups WME searches for that no detector reads — each costs a request per tile.
-      req.spareGroups = [
-        params.mapProblemsFilter && "Map Problems",
-        params.venueUpdateRequestsFilter && "Place Update Requests",
-      ].filter(Boolean);
-      if (wake) { const w = wake; wake = null; w(); }
-    }
-
-    const recordAll = (entries) => { for (let i = 0; i < entries.length; i++) record(entries[i]); };
-    const observer = new Observer((list) => recordAll(list.getEntries()));
-    try { observer.observe({ type: "mark" }); } catch (e) { observer.observe({ entryTypes: ["mark"] }); }
-    // WME clears both marks as soon as a request ends, so the buffer only ever
-    // holds start marks of requests still in flight — read them synchronously.
-    const syncMarks = () => recordAll(perf.getEntriesByType("mark"));
-    syncMarks();
-
-    // Requests of `kind` still in flight. One stuck past the timeout is
-    // abandoned (treated as failed) so its tile is retried instead of hanging.
-    function inFlight(kind) {
-      let n = 0;
-      for (const req of requests.values()) {
-        if (req.kind !== kind || req.endedAt != null) continue;
-        if (perf.now() - req.startedAt > REQUEST_TIMEOUT_MS) {
-          req.endedAt = perf.now();
-          req.status = "timeout";
-          continue;
-        }
-        n++;
-      }
-      return n;
-    }
-
-    // Resolve on the next end mark, or after `ms` so stops and timeouts are seen.
-    function nextEnd(ms) {
-      return new Promise((resolve) => {
-        const done = () => { clearTimeout(timer); resolve(); };
-        const timer = setTimeout(() => { if (wake === done) wake = null; resolve(); }, ms);
-        wake = done;
-      });
-    }
-
-    // One macrotask. WME merges an Issue Tracker response in microtasks right
-    // after its end mark, so this guarantees the merge has run.
-    function nextTask() {
-      return new Promise((resolve) => {
-        const channel = new MessageChannel();
-        channel.port1.onmessage = () => { channel.port1.close(); resolve(); };
-        channel.port2.postMessage(null);
-      });
-    }
-
-    async function settle(kind) {
-      for (;;) {
-        syncMarks();
-        while (inFlight(kind)) {
-          if (isStopped()) return false;
-          await nextEnd(250);
-        }
-        await nextTask();
-        syncMarks();
-        if (!inFlight(kind)) return !isStopped();
-      }
-    }
-
-    // The response currently in the data model: the most recently merged success.
-    function latestSuccess(kind) {
-      let best = null;
-      for (const req of requests.values()) {
-        if (req.kind === kind && req.status === "success" && (!best || req.endedAt > best.endedAt)) best = req;
-      }
-      return best;
-    }
-
-    function prune() {
-      const keep = new Set([latestSuccess("features"), latestSuccess("issues")]);
-      for (const [uuid, req] of requests) if (req.endedAt != null && !keep.has(req)) requests.delete(uuid);
-    }
-
-    function noLoadError(kind) {
-      const error = new Error(sawRequestMark ? NO_LOAD_MESSAGES[kind]
-        : "WME load tracking is unavailable (WME wrote no request marks). Scan stopped; baseline was not updated.");
-      error.noLoad = kind;
-      return error;
-    }
-
-    // Center the map on `tile` ({ center, zoom, rect }) and wait until WME has
-    // loaded it: every request of `kind` has ended and the latest merged
-    // response is at this zoom and covers tile.rect. Failed, aborted or stuck
-    // requests are retried with backoff. Resolves to { box, counts, request },
-    // to { uncovered: true } if a fresh response is smaller than the tile, or
-    // to null if the run was stopped. `rect: null` accepts any fresh response.
-    async function visit(tile, kind) {
-      let failures = 0, stale = 0, nudge = 0, pacedMs = 0;
-      for (;;) {
-        const waited = await rate.clearance(isStopped);
-        if (waited == null) return null;
-        pacedMs += waited;
-        // Hold the self-tuned spacing (zero unless requests are being refused).
-        for (let left = lastMoveAt + rate.gap() - perf.now(); left > 0; left = lastMoveAt + rate.gap() - perf.now()) {
-          if (isStopped()) return null;
-          pacedMs += left;
-          await sleep(Math.min(left, 500));
-        }
-        if (!await settle(kind)) return null;
-        prune();
-        const zoomChanged = sdk.Map.getZoomLevel() !== tile.zoom;
-        const t0 = perf.now();
-        lastMoveAt = t0;
-        sdk.Map.setMapCenter({ lonLat: { lon: tile.center.lon + nudge * NUDGE_DEG, lat: tile.center.lat }, zoomLevel: tile.zoom });
-        if (!await settle(kind)) return null;
-
-        let last = null; // the request this move started that ended last
-        for (const req of requests.values()) {
-          if (req.kind === kind && req.startedAt >= t0 && (!last || req.endedAt > last.endedAt)) last = req;
-        }
-        const failed = lateMergeAt[kind] >= t0 ? "late response" : last && last.status !== "success" ? last.status : null;
-        if (failed) {
-          // A tile refused by the rate limiter isn't a broken tile: wait out the
-          // pause and try again rather than spending its retries inside the ban.
-          const limited = rate.refusedSince(t0);
-          if (limited ? pacedMs > RATE_GIVE_UP_MS : ++failures > MAX_TILE_RETRIES) {
-            throw new Error(limited
-              ? "WME is rate limiting this session (429 Too Many Requests). Scan stopped; baseline was not updated."
-              : `WME kept failing to load map data (${failed}). Scan stopped; baseline was not updated.`);
-          }
-          if (!limited && (failed === "error" || failed === "timeout")) await sleep(RETRY_BASE_MS * 2 ** (failures - 1));
-          nudge = nudge === 1 ? -1 : 1;
-          continue;
-        }
-        if (last && (!last.box || !Number.isFinite(last.zoom))) {
-          throw new Error("WME load tracking has changed. Scan stopped; baseline was not updated.");
-        }
-        if (last && last.zoom !== tile.zoom) {
-          throw new Error(`WME didn't switch the map to zoom ${tile.zoom}. Scan stopped; baseline was not updated.`);
-        }
-
-        const loaded = latestSuccess(kind);
-        const usable = loaded && loaded.box && loaded.zoom === tile.zoom && (!zoomChanged || loaded.startedAt >= t0);
-        if (usable && (tile.rect ? boxContains(loaded.box, tile.rect) : loaded === last)) {
-          return { box: loaded.box, counts: loaded.counts, request: loaded };
-        }
-        if (last && tile.rect) return { uncovered: true, box: last.box };
-        // Nothing loaded for this spot (no request, or only an older response):
-        // re-center a hair away so WME requests it fresh.
-        if (++stale > 2) throw noLoadError(kind);
-        nudge = nudge === 1 ? -1 : 1;
-      }
-    }
-
-    return { visit, disconnect: () => { rate.disconnect(); observer.disconnect(); } };
+  // --- Tile grid -----------------------------------------------------------
+  // A plain lon/lat grid over the region's bbox (the server's size limits were
+  // measured in degrees). Cells outside the polygon are dropped; a cell the
+  // boundary doesn't pass through and whose center is inside lies wholly in the
+  // region, so its objects skip the per-object polygon test.
+  function computeGrid(polygon, step) {
+    const b = bboxOfRing(polygon[0]);
+    const cols = Math.max(1, Math.ceil((b[2] - b[0]) / step - 1e-9));
+    const rows = Math.max(1, Math.ceil((b[3] - b[1]) / step - 1e-9));
+    return { x0: b[0], y0: b[1], step, cols, rows };
   }
 
-  // --- Scan layers ---------------------------------------------------------
-  // WME only requests data for visible layers, so each pass shows just what its
-  // detectors read: smaller, faster responses, and hidden imagery stops loading
-  // tiles. The editor's own layer choices are saved first (in GM storage, so a
-  // tab closed mid-scan is repaired on the next load) and restored afterwards.
+  function gridCellBox(grid, index) {
+    const col = index % grid.cols, row = Math.floor(index / grid.cols);
+    const x = grid.x0 + col * grid.step, y = grid.y0 + row * grid.step;
+    return [x, y, x + grid.step, y + grid.step];
+  }
+
+  // Call mark(index) for every grid cell the straight edge a→b ([lon, lat])
+  // passes through (a grid walk; both neighbours are marked at exact corners).
+  function markEdgeCells(grid, a, b, mark) {
+    const ax = (a[0] - grid.x0) / grid.step, ay = (a[1] - grid.y0) / grid.step;
+    const bx = (b[0] - grid.x0) / grid.step, by = (b[1] - grid.y0) / grid.step;
+    let cx = Math.floor(ax), cy = Math.floor(ay);
+    const ex = Math.floor(bx), ey = Math.floor(by);
+    const dx = bx - ax, dy = by - ay;
+    const sx = dx > 0 ? 1 : -1, sy = dy > 0 ? 1 : -1;
+    const tdx = dx !== 0 ? Math.abs(1 / dx) : Infinity;
+    const tdy = dy !== 0 ? Math.abs(1 / dy) : Infinity;
+    let tx = dx !== 0 ? (dx > 0 ? cx + 1 - ax : ax - cx) * tdx : Infinity;
+    let ty = dy !== 0 ? (dy > 0 ? cy + 1 - ay : ay - cy) * tdy : Infinity;
+    const cell = (c, r) => { if (c >= 0 && c < grid.cols && r >= 0 && r < grid.rows) mark(r * grid.cols + c); };
+    cell(cx, cy);
+    for (let n = Math.abs(ex - cx) + Math.abs(ey - cy); n > 0; n--) {
+      if (tx < ty) { cx += sx; tx += tdx; }
+      else if (ty < tx) { cy += sy; ty += tdy; }
+      else { cell(cx + sx, cy); cell(cx, cy + sy); cx += sx; cy += sy; tx += tdx; ty += tdy; n--; }
+      cell(cx, cy);
+    }
+    cell(ex, ey);
+  }
+
+  // Request boxes covering the region at `step` degrees: [{ box, inside }].
+  const tileCache = new Map(); // "<regionKey>:<step>" -> tiles (regions are fixed once saved)
+  function regionTiles(polygon, step) {
+    const cacheKey = regionKey({ coordinates: polygon }) + ":" + step;
+    if (tileCache.has(cacheKey)) return tileCache.get(cacheKey);
+    const grid = computeGrid(polygon, step);
+    const total = grid.cols * grid.rows;
+    const edge = new Uint8Array(total);
+    for (const ring of polygon) {
+      for (let k = 0; k < ring.length - 1; k++) markEdgeCells(grid, ring[k], ring[k + 1], (i) => { edge[i] = 1; });
+    }
+    const tiles = [];
+    const index = indexPolygon(polygon);
+    for (let i = 0; i < total; i++) {
+      const box = gridCellBox(grid, i);
+      const inside = index.pointIn([(box[0] + box[2]) / 2, (box[1] + box[3]) / 2]);
+      if (inside || edge[i]) tiles.push({ box, inside: inside && !edge[i] });
+    }
+    tileCache.set(cacheKey, tiles);
+    return tiles;
+  }
+
+  function quarterTiles(tile) {
+    const [x1, y1, x2, y2] = tile.box;
+    const xm = (x1 + x2) / 2, ym = (y1 + y2) / 2;
+    return [[x1, y1, xm, ym], [xm, y1, x2, ym], [x1, ym, xm, y2], [xm, ym, x2, y2]]
+      .map((box) => ({ box, inside: tile.inside }));
+  }
+
+  // --- Legacy layer restore ------------------------------------------------
+  // Versions before 0.4 hid WME layers during a scan and restored them after.
+  // A tab closed mid-scan by such a version left them hidden; put them back once.
   const LAYER_RESTORE_KEY = "wme-auto-scan:layer-restore:v1";
-  const SCAN_LAYER_NAMES = [
-    "roads", "paths", "closures", "places", "junctionBoxes", "permanentHazards", "gpsPoints",
-    "houseNumbers", "mapComments", "cities", "satelliteImagery", "mapProblems", "updateRequests", "editSuggestions",
-  ];
-  let layerSnapshot = null;
-
-  function layerVisible(name) {
-    try { return sdk.LayerSwitcher.getWMELayerVisibility({ layerName: name }); } catch (e) { return null; }
-  }
-
-  function setLayerVisible(name, visible) {
-    const current = layerVisible(name);
-    if (typeof current !== "boolean" || current === visible) return;
-    try { sdk.LayerSwitcher.setWMELayerVisibility({ layerName: name, isVisible: visible }); } catch (e) {}
-  }
-
-  function savedLayerSnapshot() {
-    if (layerSnapshot) return layerSnapshot;
+  async function restoreLegacyLayers() {
+    let saved = null;
     try {
       const raw = GM_getValue(LAYER_RESTORE_KEY, null);
-      return raw ? (typeof raw === "string" ? JSON.parse(raw) : raw) : null;
-    } catch (e) { return null; }
-  }
-
-  function showOnlyLayers(visible) {
-    if (!savedLayerSnapshot()) {
-      const prior = {};
-      for (const name of SCAN_LAYER_NAMES) {
-        const v = layerVisible(name);
-        if (typeof v === "boolean") prior[name] = v;
-      }
-      layerSnapshot = prior;
-      try { GM_setValue(LAYER_RESTORE_KEY, JSON.stringify(prior)); } catch (e) {}
-    }
-    for (const name of SCAN_LAYER_NAMES) setLayerVisible(name, visible.includes(name));
-  }
-
-  function restoreLayers() {
-    const saved = savedLayerSnapshot();
+      saved = raw ? (typeof raw === "string" ? JSON.parse(raw) : raw) : null;
+    } catch (e) { saved = null; }
     if (!saved) return;
-    for (const name of Object.keys(saved)) setLayerVisible(name, saved[name]);
-    layerSnapshot = null;
+    for (const [name, visible] of Object.entries(saved)) {
+      try {
+        if (await sdk.LayerSwitcher.getWMELayerVisibility({ layerName: name }) !== visible) {
+          await sdk.LayerSwitcher.setWMELayerVisibility({ layerName: name, isVisible: visible });
+        }
+      } catch (e) {}
+    }
     try { GM_setValue(LAYER_RESTORE_KEY, null); } catch (e) {}
   }
 
@@ -831,14 +737,14 @@
   let activePreview = null;
   let previewZoomHandler = null;
 
-  function ensurePreviewLayers() {
+  async function ensurePreviewLayers() {
     if (previewLayersReady) return;
     try {
-      sdk.Map.addLayer({
+      await sdk.Map.addLayer({
         layerName: REGION_PREVIEW_LAYER,
         styleRules: [{ style: { strokeColor: "#0b7fd4", strokeWidth: 3, strokeOpacity: 0.95, fillColor: "#0b7fd4", fillOpacity: 0.08 } }],
       });
-      sdk.Map.addLayer({
+      await sdk.Map.addLayer({
         layerName: BBOX_PREVIEW_LAYER,
         styleRules: [{ style: { strokeColor: "#16a34a", strokeWidth: 1.5, strokeOpacity: 0.9, fillColor: "#16a34a", fillOpacity: 0.06 } }],
       });
@@ -848,13 +754,13 @@
     }
   }
 
-  function clearPreview() {
-    if (previewLayersReady) {
-      try { sdk.Map.removeAllFeaturesFromLayer({ layerName: REGION_PREVIEW_LAYER }); } catch (e) {}
-      try { sdk.Map.removeAllFeaturesFromLayer({ layerName: BBOX_PREVIEW_LAYER }); } catch (e) {}
-    }
+  async function clearPreview() {
     activePreview = null;
     disarmPreviewAutoClear();
+    if (previewLayersReady) {
+      try { await sdk.Map.removeAllFeaturesFromLayer({ layerName: REGION_PREVIEW_LAYER }); } catch (e) {}
+      try { await sdk.Map.removeAllFeaturesFromLayer({ layerName: BBOX_PREVIEW_LAYER }); } catch (e) {}
+    }
   }
 
   // Arm a one-shot: the next zoom change wipes the preview. Armed on a delay so
@@ -884,14 +790,14 @@
   }
 
   // Zoom to the saved region and outline it.
-  function previewRegion() {
+  async function previewRegion() {
     const region = settings.region;
     if (!region || !region.coordinates) return;
-    ensurePreviewLayers();
-    clearPreview();
+    await ensurePreviewLayers();
+    await clearPreview();
     try {
-      sdk.Map.addFeaturesToLayer({ features: [polygonRingFeature("region", region.coordinates)], layerName: REGION_PREVIEW_LAYER });
-      sdk.Map.zoomToExtent({ bbox: bboxOfRing(region.coordinates[0]) });
+      await sdk.Map.addFeaturesToLayer({ features: [polygonRingFeature("region", region.coordinates)], layerName: REGION_PREVIEW_LAYER });
+      await sdk.Map.zoomToExtent({ bbox: bboxOfRing(region.coordinates[0]) });
       activePreview = "region";
       armPreviewAutoClear();
     } catch (e) {
@@ -899,39 +805,27 @@
     }
   }
 
-  // Zoom out and draw every tile box the first scan pass will visit: the
-  // optimized productive cells if a complete mask exists, else the full
-  // polygon-culled grid, estimated from the current view without moving the map.
+  // Zoom out and draw the request boxes of the finest pass the enabled
+  // detectors need (the pass with the most requests).
   async function previewScanBoxes() {
     const region = settings.region;
     if (!region || !region.coordinates) return;
-    ensurePreviewLayers();
-    clearPreview();
-    const polygon = region.coordinates;
-    const d = settings.detectors;
-    const roads = d.closure.enabled || d.edit.enabled || !(d.report.enabled || d.suggestion.enabled);
+    await ensurePreviewLayers();
+    await clearPreview();
     try {
-      let grid, cells;
-      const mask = loadMask(region);
-      if (roads && mask && mask.complete && Array.isArray(mask.productive)) {
-        grid = mask.grid;
-        cells = mask.productive;
-      } else {
-        const kind = roads ? "features" : "issues";
-        const zoom = roads ? ROADS_ZOOM : ISSUES_ZOOM;
-        grid = computeGrid(polygon, estimatedSpan(kind, zoom), zoom);
-        cells = relevantCells(grid, polygon);
-      }
-      let capped = false;
-      if (cells.length > MAX_PREVIEW_BOXES) { cells = cells.slice(0, MAX_PREVIEW_BOXES); capped = true; }
-      const features = cells.map((idx) => boxFeature("box" + idx, gridCellBox(grid, idx)));
-      sdk.Map.addFeaturesToLayer({ features, layerName: BBOX_PREVIEW_LAYER });
-      sdk.Map.zoomToExtent({ bbox: bboxOfRing(polygon[0]) });
+      const passes = plannedPasses();
+      if (!passes.length) { setStatus("Turn on a detector to see its scan areas."); return; }
+      const finest = passes.reduce((a, b) => (b.tiles.length > a.tiles.length ? b : a));
+      let tiles = finest.tiles;
+      const capped = tiles.length > MAX_PREVIEW_BOXES;
+      if (capped) tiles = tiles.slice(0, MAX_PREVIEW_BOXES);
+      await sdk.Map.addFeaturesToLayer({ features: tiles.map((t, i) => boxFeature("box" + i, t.box)), layerName: BBOX_PREVIEW_LAYER });
+      await sdk.Map.zoomToExtent({ bbox: bboxOfRing(region.coordinates[0]) });
       activePreview = "boxes";
       armPreviewAutoClear();
       setStatus(capped
-        ? `Showing first ${MAX_PREVIEW_BOXES} of ${features.length}+ scan areas. Zoom to clear.`
-        : `Showing ${features.length} scan areas. Zoom to clear.`);
+        ? `Showing first ${MAX_PREVIEW_BOXES} of ${finest.tiles.length} ${finest.label} requests. Zoom to clear.`
+        : `Showing ${tiles.length} ${finest.label} requests. Zoom to clear.`);
     } catch (e) {
       console.error("[WME Auto Scan] scan-box preview failed", e);
       setStatus("Couldn't preview scan areas: " + e.message);
@@ -954,18 +848,14 @@
   const MIN_FIT_ZOOM = 12, MAX_FIT_ZOOM = 20, DEFAULT_POINT_ZOOM = 17;
 
   // Zoom level whose viewport contains bbox ([minLon,minLat,maxLon,maxLat]),
-  // mirroring sdk.Map.zoomToExtent without moving the live map (which the scan
-  // is still driving). Degenerate/absent boxes fall back to a close point zoom.
+  // mirroring sdk.Map.zoomToExtent without moving the editor's map.
+  // Degenerate/absent boxes fall back to a close point zoom.
   function zoomForBbox(bbox) {
     if (!bbox) return DEFAULT_POINT_ZOOM;
     const [minLon, minLat, maxLon, maxLat] = bbox;
     const lonSpan = maxLon - minLon, latSpan = maxLat - minLat;
     if (!(lonSpan > 0) && !(latSpan > 0)) return DEFAULT_POINT_ZOOM;
-    let view = { w: 1200, h: 800 };
-    try {
-      const el = sdk.Map.getMapViewportElement();
-      if (el && el.clientWidth && el.clientHeight) view = { w: el.clientWidth, h: el.clientHeight };
-    } catch (e) { /* not mounted; use defaults */ }
+    const view = wme.viewport; // cached by refreshWmeInfo()
     const worldPx = 256, pad = 0.8; // tile size at zoom 0; leave a margin around the feature
     const merc = (lat) => Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI / 180) / 2));
     const zoomLon = lonSpan > 0 ? Math.log2((view.w * pad) * 360 / (worldPx * lonSpan)) : Infinity;
@@ -975,9 +865,8 @@
     return Math.max(MIN_FIT_ZOOM, Math.min(MAX_FIT_ZOOM, z));
   }
 
-  // getPermalink() encodes the *current* map view — during a scan that is the
-  // last tile visited, not the feature. Rewrite lon/lat (and zoom) so the link
-  // lands on and fits the feature rather than wherever the scan finished.
+  // getPermalink() encodes the editor's *current* view. Rewrite lon/lat (and
+  // zoom) so the link lands on and fits the feature instead.
   function permalinkAt(permalink, centroid, zoom) {
     const set = (url, key, value) => (value == null ? url :
       new RegExp(`[?&]${key}=`).test(url)
@@ -991,20 +880,12 @@
     return url;
   }
 
+  // The editor's selection is never touched: the segments go in the link's
+  // own segments= parameter.
   function buildLinks(centroid, segmentIds, bbox) {
     const links = {};
-    // WME permalink: select the segments, then read the permalink so WME
-    // encodes the selection for us; fall back to manual &segments=.
-    try {
-      if (segmentIds && segmentIds.length) {
-        sdk.Editing.setSelection({ selection: { objectType: "segment", ids: segmentIds } });
-      }
-    } catch (e) { /* selection may fail if not loaded */ }
-    let wme = "";
-    try {
-      wme = sdk.Map.getPermalink();
-    } catch (e) { wme = `https://www.waze.com/editor`; }
-    if (segmentIds && segmentIds.length && !/[?&]segments=/.test(wme)) {
+    let wme = editPermalinkBase();
+    if (segmentIds && segmentIds.length) {
       wme += (wme.includes("?") ? "&" : "?") + "segments=" + segmentIds.join(",");
     }
     links.wme = permalinkAt(wme, centroid, zoomForBbox(bbox));
@@ -1113,17 +994,13 @@
     return false;
   }
 
-  function streetName(streetId) {
-    if (!streetId) return null;
-    try {
-      const s = sdk.DataModel.Streets.getById({ streetId });
-      return s && s.name ? s.name : null;
-    } catch (e) { return null; }
-  }
-
+  // Closure dates arrive as local wall time, "YYYY-MM-DD HH:mm". The ISO form
+  // with a "T" is parsed as local time in every browser; the space form isn't
+  // guaranteed to parse at all.
   function toUnixSeconds(dateStr) {
     if (!dateStr) return null;
-    const t = Date.parse(dateStr);
+    const s = String(dateStr);
+    const t = Date.parse(/^\d{4}-\d\d-\d\d \d/.test(s) ? s.replace(" ", "T") : s);
     return Number.isNaN(t) ? null : Math.floor(t / 1000);
   }
 
@@ -1161,35 +1038,46 @@
     return s;
   }
 
+  // Raw Features closure -> the fields the closure detector reads.
+  function normalizeClosure(raw, users) {
+    return {
+      id: String(raw.id),
+      segmentId: raw.segID,
+      isForward: !!raw.forward,
+      startDate: raw.startDate,
+      endDate: raw.endDate,
+      status: raw.closureStatus,
+      eventId: raw.eventId || null,
+      geometry: raw.geometry,
+      modificationData: { createdBy: users.get(raw.createdBy) || null },
+    };
+  }
+
   // Build a per-scan closure detector state.
   function makeClosureDetector() {
     const closuresById = new Map(); // dedupe across tiles
 
     return {
       key: "closure",
-      collect() {
-        let list = [];
-        try {
-          list = sdk.DataModel.RoadClosures.getAll();
-        } catch (e) { return; }
-        for (const c of list) {
-          if (closuresById.has(c.id)) continue;
+      collect(reply, tile, users) {
+        for (const raw of (reply.roadClosures && reply.roadClosures.objects) || []) {
+          if (!raw || raw.id == null || closuresById.has(String(raw.id))) continue;
+          const c = normalizeClosure(raw, users);
           if (isEndedClosure(c)) continue; // skip closures that have already ended
-          const seg = safeSegment(c.segmentId);
-          if (!seg || !seg.geometry) continue;
-          const coords = seg.geometry.coordinates || [];
-          if (!lineInPolygon(coords, scanState.polygon)) continue;
-          noteUsername(c.modificationData && c.modificationData.createdBy);
-          closuresById.set(c.id, { closure: c, seg });
+          const coords = c.geometry && c.geometry.coordinates;
+          if (!coords || !coords.length) continue;
+          if (!tile.inside && !scanState.region.lineIn(coords)) continue;
+          noteUsername(c.modificationData.createdBy);
+          closuresById.set(c.id, c);
         }
       },
-      async finalize() {
+      async finalize(api) {
         const items = [...closuresById.values()];
         const store = seenFor(settings.region, "closure");
 
         // Which closures are newly seen this scan? Then mark everything seen.
-        const fresh = items.filter(({ closure }) => !store.ids.has(String(closure.id)));
-        for (const { closure } of items) store.ids.add(String(closure.id));
+        const fresh = items.filter((c) => !store.ids.has(c.id));
+        for (const c of items) store.ids.add(c.id);
 
         if (!store.baseline) {
           // First scan of this region: record a silent baseline, no alerts.
@@ -1198,11 +1086,12 @@
         }
         if (!fresh.length) return 0;
 
-        // Group only the newly-appeared closures whose segments are connected.
-        const groups = groupByConnectivity(fresh);
+        // Group only the newly-appeared closures that touch or share an event.
+        const groups = groupClosures(fresh);
         let sent = 0;
         for (const group of groups) {
-          const note = buildClosureNotification(group);
+          const context = await closureContext(api, group);
+          const note = buildClosureNotification(group, context);
           if (!note) continue; // fully whitelisted
           const results = await sendNotification("closure", note);
           if (results.some((r) => r.endsWith(":ok"))) sent++;
@@ -1212,14 +1101,10 @@
     };
   }
 
-  function safeSegment(segmentId) {
-    try {
-      return sdk.DataModel.Segments.getById({ segmentId });
-    } catch (e) { return null; }
-  }
-
-  // Union-find over segments by shared node ids.
-  function groupByConnectivity(items) {
+  // Union-find: closures on the same segment or the same closure event, or
+  // whose geometries share an endpoint (within ~2 m), form one group.
+  const ENDPOINT_TOLERANCE_DEG = 2e-5;
+  function groupClosures(closures) {
     const parent = new Map();
     const find = (x) => {
       while (parent.get(x) !== x) {
@@ -1228,41 +1113,79 @@
       }
       return x;
     };
-    const union = (a, b) => { parent.set(find(a), find(b)); };
+    const add = (x) => { if (!parent.has(x)) parent.set(x, x); };
+    const union = (a, b) => { add(a); add(b); parent.set(find(a), find(b)); };
 
-    for (const { seg } of items) {
-      const key = "s" + seg.id;
-      if (!parent.has(key)) parent.set(key, key);
-      for (const node of [seg.fromNodeId, seg.toNodeId]) {
-        if (node == null) continue;
-        const nk = "n" + node;
-        if (!parent.has(nk)) parent.set(nk, nk);
-        union(key, nk);
+    const cellSize = ENDPOINT_TOLERANCE_DEG * 5;
+    const cells = new Map(); // "cx:cy" -> [{ pt, key }]
+    const cellOf = (pt) => [Math.floor(pt[0] / cellSize), Math.floor(pt[1] / cellSize)];
+    for (const c of closures) {
+      const key = "c" + c.id;
+      add(key);
+      if (c.segmentId != null) union(key, "s" + c.segmentId);
+      if (c.eventId) union(key, "e" + c.eventId);
+      const coords = c.geometry.coordinates;
+      for (const pt of [coords[0], coords[coords.length - 1]]) {
+        const [cx, cy] = cellOf(pt);
+        for (let dx = -1; dx <= 1; dx++) {
+          for (let dy = -1; dy <= 1; dy++) {
+            for (const other of cells.get(`${cx + dx}:${cy + dy}`) || []) {
+              if (Math.abs(other.pt[0] - pt[0]) <= ENDPOINT_TOLERANCE_DEG && Math.abs(other.pt[1] - pt[1]) <= ENDPOINT_TOLERANCE_DEG) union(key, other.key);
+            }
+          }
+        }
+        const k = `${cx}:${cy}`;
+        if (!cells.has(k)) cells.set(k, []);
+        cells.get(k).push({ pt, key });
       }
     }
     const buckets = new Map();
-    for (const item of items) {
-      const root = find("s" + item.seg.id);
+    for (const c of closures) {
+      const root = find("c" + c.id);
       if (!buckets.has(root)) buckets.set(root, []);
-      buckets.get(root).push(item);
+      buckets.get(root).push(c);
     }
     return [...buckets.values()];
   }
 
-  function buildClosureNotification(group) {
+  // Closures-only replies carry no segments or street names, so look up just
+  // the segments a new group sits on (one small request, rarely more) for the
+  // notification's road names and types. A failed lookup only costs the names.
+  async function closureContext(api, group) {
+    const segments = new Map(), streets = new Map();
+    try {
+      const coords = group.flatMap((c) => c.geometry.coordinates);
+      const box = padBbox(bboxOfRing(coords), 0.05);
+      const nx = Math.max(1, Math.ceil((box[2] - box[0]) / ROAD_TILE_DEG));
+      const ny = Math.max(1, Math.ceil((box[3] - box[1]) / ROAD_TILE_DEG));
+      if (nx * ny > 16) return { segments, streets }; // a sprawling event: names aren't worth 16+ requests
+      const w = (box[2] - box[0]) / nx, h = (box[3] - box[1]) / ny;
+      for (let i = 0; i < nx; i++) {
+        for (let j = 0; j < ny; j++) {
+          const reply = await api.features([box[0] + i * w, box[1] + j * h, box[0] + (i + 1) * w, box[1] + (j + 1) * h], { roadTypes: ALL_ROAD_TYPES });
+          for (const s of (reply.segments && reply.segments.objects) || []) segments.set(s.id, s);
+          for (const st of (reply.streets && reply.streets.objects) || []) if (st.name) streets.set(st.id, st.name);
+        }
+      }
+    } catch (e) {
+      if (e.stopped) throw e;
+      console.warn("[WME Auto Scan] couldn't look up closure road names", e);
+    }
+    return { segments, streets };
+  }
+
+  function buildClosureNotification(group, context) {
     // Suppress whole group only if every closure's reporter is whitelisted.
-    const visible = group.filter(
-      ({ closure }) => !isWhitelisted(closure.modificationData && closure.modificationData.createdBy)
-    );
+    const visible = group.filter((c) => !isWhitelisted(c.modificationData.createdBy));
     if (!visible.length) return null;
 
     // Collapse closures onto their segment: a two-way closure produces one
     // record per direction on the same segment, so we group by segment id and
     // present a single line per segment (direction merged).
-    const bySeg = new Map(); // segId -> { seg, closures: [] }
-    for (const { seg, closure } of visible) {
-      if (!bySeg.has(seg.id)) bySeg.set(seg.id, { seg, closures: [] });
-      bySeg.get(seg.id).closures.push(closure);
+    const bySeg = new Map(); // segId -> closures
+    for (const c of visible) {
+      if (!bySeg.has(c.segmentId)) bySeg.set(c.segmentId, []);
+      bySeg.get(c.segmentId).push(c);
     }
 
     const lines = [];
@@ -1270,11 +1193,13 @@
     let allCoords = [];
     const segIds = [];
 
-    for (const { seg, closures } of bySeg.values()) {
-      segIds.push(seg.id);
-      allCoords = allCoords.concat(seg.geometry.coordinates || []);
-      const rt = roadTypeName(seg.roadType);
-      const name = streetName(seg.primaryStreetId) || "Unnamed road";
+    for (const [segmentId, closures] of bySeg) {
+      if (segmentId != null) segIds.push(segmentId);
+      const seg = context.segments.get(segmentId);
+      const coords = (seg && seg.geometry && seg.geometry.coordinates) || closures.flatMap((c) => c.geometry.coordinates);
+      allCoords = allCoords.concat(coords);
+      const rt = seg ? roadTypeName(seg.roadType) : "road";
+      const name = (seg && context.streets.get(seg.primaryStreetID)) || "Unnamed road";
       const dir = directionLabel(closures);
       const reporters = uniqueReporters(closures);
       const reporterMd = reporters.map((r) => (r ? `[${r}](${PROFILE_URL(r)})` : "unknown")).join(", ");
@@ -1338,26 +1263,148 @@
   }
 
   // ---------------------------------------------------------------------------
+  // Issue Tracker search (Update Requests, Map Suggestions)
+  // ---------------------------------------------------------------------------
+  // The Issue Tracker's bbox search goes over gRPC-web (binary protobuf), so it
+  // runs through WME's own client — the call WME makes for its Issue Tracker
+  // layer — with the script's own filters: every open Update Request and open
+  // Map Suggestion, whatever the editor's Issue Tracker filter panel is set to.
+  // Results are WME model objects; the normalizers below read them the same way
+  // the SDK does, so the detectors see SDK-shaped data.
+  const ISSUE_TILE_DEG = 1; // 2° boxes returned 400+ results per group with no sign of a cap
+  const ISSUE_SPLIT_AT = 500; // a group this full may be capped (Features caps at 500): split
+  const ISSUE_MIN_TILE_DEG = 0.0625;
+
+  function issueClient() {
+    const W = PAGE.W;
+    const client = W && W.issueTrackerController && W.issueTrackerController.descartesClient;
+    if (!client || typeof client.searchIssuesByBbox !== "function" || !W.map) {
+      throw new Error("WME's Issue Tracker search isn't available in this WME version. Scan stopped; baseline was not updated.");
+    }
+    return client;
+  }
+
+  async function searchIssues(box, keys, isStopped) {
+    const client = issueClient();
+    const params = { bbox: box.map((v) => +v.toFixed(6)) };
+    if (keys.includes("report")) params.mapUpdateRequestsFilter = { isOpen: true, commentCountRanges: [] };
+    if (keys.includes("suggestion")) params.mapSuggestionsFilter = { status: ["OPEN"] };
+    let failures = 0;
+    for (;;) {
+      if (isStopped()) throw stoppedError();
+      try {
+        // Page-owned copies, so WME's code never handles userscript-sandbox objects.
+        const pageParams = PAGE.JSON.parse(JSON.stringify(params));
+        const uuid = `${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`;
+        const result = await client.searchIssuesByBbox(pageParams, PAGE.W.map, uuid);
+        if (isStopped()) throw stoppedError();
+        return result || {};
+      } catch (e) {
+        if (e && e.stopped) throw e;
+        if (++failures > MAX_RETRIES) {
+          throw new Error(`WME's Issue Tracker search kept failing (${(e && e.message) || e}). Scan stopped; baseline was not updated.`);
+        }
+        await sleep(RETRY_BASE_MS * 2 ** (failures - 1));
+      }
+    }
+  }
+
+  function issuePass(keys, polygon) {
+    const count = (reply, k) => ((reply[k] && reply[k].objects) || []).length;
+    return {
+      label: "issues", keys, tiles: regionTiles(polygon, ISSUE_TILE_DEG),
+      fetch: (api, tile) => searchIssues(tile.box, keys, () => !scanState.running),
+      // A group that hit a possible cap is re-searched as quarters (items are
+      // deduped by id, so overlap with the parent reply is harmless).
+      split: (reply, tile) => {
+        const full = ["mapUpdateRequests", "editSuggestions", "segmentSuggestions"].some((k) => count(reply, k) >= ISSUE_SPLIT_AT);
+        if (!full) return null;
+        if (tile.box[2] - tile.box[0] <= ISSUE_MIN_TILE_DEG) {
+          console.warn("[WME Auto Scan] An Issue Tracker search returned 500+ results in a small area; some may be missing.");
+          return null;
+        }
+        return quarterTiles(tile);
+      },
+    };
+  }
+
+  // Getter-or-attribute access on a WME model object.
+  function modelAttr(m, key) {
+    if (!m) return undefined;
+    if (typeof m.getAttribute === "function") return m.getAttribute(key);
+    return m.attributes ? m.attributes[key] : m[key];
+  }
+  function modelCall(m, method, fallback) {
+    return m && typeof m[method] === "function" ? m[method]() : fallback;
+  }
+
+  // WME's numeric Update Request types (mirrors the SDK's table).
+  const UPDATE_REQUEST_TYPES = {
+    6: "INCORRECT_TURN", 7: "INCORRECT_ADDRESS", 8: "INCORRECT_ROUTE", 9: "INCORRECT_MISSING_ROUNDABOUT",
+    10: "INCORRECT_GENERAL_ERROR", 11: "TURN_NOT_ALLOWED", 12: "INCORRECT_JUNCTION", 13: "MISSING_BRIDGE_OVERPASS",
+    14: "WRONG_DRIVING_DIRECTIONS", 15: "MISSING_EXIT", 16: "MISSING_ROAD", 19: "BLOCKED_ROAD",
+  };
+
+  function normalizeUpdateRequest(m) {
+    const type = modelAttr(m, "type");
+    return {
+      id: modelCall(m, "getID", modelAttr(m, "id")),
+      isOpen: modelCall(m, "getOpenState", modelAttr(m, "open")),
+      resolvedOn: modelCall(m, "getResolvedOn", modelAttr(m, "resolvedOn")) ?? null,
+      geometry: modelAttr(m, "geoJSONGeometry") || modelCall(m, "getLocation", null),
+      description: modelCall(m, "getDescription", modelAttr(m, "description")) || null,
+      reportedOn: modelCall(m, "getDriveDate", modelAttr(m, "driveDate")),
+      severity: modelCall(m, "getSeverity", null),
+      source: modelCall(m, "getSource", modelAttr(m, "source")),
+      updateRequestType: UPDATE_REQUEST_TYPES[type] || null,
+      typeText: modelAttr(m, "typeText") || null,
+    };
+  }
+
+  function normalizeEditSuggestion(m) {
+    const suggestions = modelCall(m, "getSuggestions", modelAttr(m, "suggestions")) || [];
+    return {
+      id: String(modelCall(m, "getID", modelAttr(m, "id"))),
+      bbox: modelCall(m, "getBbox", modelAttr(m, "bbox")),
+      source: modelAttr(m, "source"),
+      status: modelCall(m, "getStatus", modelAttr(m, "status")),
+      modificationData: { createdOn: modelCall(m, "getCreatedOn", modelAttr(m, "createdOn")) ?? null },
+      suggestions: [...suggestions].map((x) => ({
+        edits: [...(modelCall(x, "getEntityEdits", x && x.edits) || [])].map((e) => ({ actionType: e.actionType, objectType: e.objectType })),
+      })),
+    };
+  }
+
+  function normalizeSegmentSuggestion(m) {
+    return {
+      id: String(modelCall(m, "getID", modelAttr(m, "id"))),
+      status: modelAttr(m, "status"),
+      source: modelAttr(m, "source"),
+      geometry: modelAttr(m, "geoJSONGeometry"),
+      streetName: modelAttr(m, "streetName") || null,
+      cityName: modelAttr(m, "cityName") || null,
+      roadType: modelAttr(m, "roadType"),
+      createdOn: modelAttr(m, "createdOn") ?? null,
+    };
+  }
+
+  // ---------------------------------------------------------------------------
   // Update request detector ("Update Requests")
   // ---------------------------------------------------------------------------
-  // Scans WME's user-reported update requests (sdk.DataModel.MapUpdateRequests) —
-  // the map problem reports drivers file from the app. WME only loads these when
-  // the Update Requests group is enabled in the Issue Tracker filter panel, and
-  // the panel's status filter (Open/Closed) gates which ones are fetched; see
-  // updateRequestsFilterWarning(). URs carry no editor username, so the whitelist
-  // doesn't apply.
+  // Open user-reported update requests — the map problem reports drivers file
+  // from the app. URs carry no editor username, so the whitelist doesn't apply.
   function makeReportDetector() {
     const requestsById = new Map(); // dedupe across tiles
     return {
       key: "report",
-      collect() {
-        const list = sdk.DataModel.MapUpdateRequests.getAll();
-        for (const r of list) {
-          if (requestsById.has(r.id)) continue;         // cross-tile dedupe
+      collect(reply, tile) {
+        for (const m of (reply.mapUpdateRequests && reply.mapUpdateRequests.objects) || []) {
+          const r = normalizeUpdateRequest(m);
+          if (r.id == null || requestsById.has(r.id)) continue; // cross-tile dedupe
           if (!r.isOpen || r.resolvedOn != null) continue; // only open/unresolved
           const pt = r.geometry && r.geometry.coordinates;
           if (!pt) continue;
-          if (!pointInPolygon(pt, scanState.polygon)) continue; // region filter
+          if (!tile.inside && !scanState.region.pointIn(pt)) continue; // region filter
           requestsById.set(r.id, r);
         }
       },
@@ -1383,7 +1430,7 @@
   function buildUpdateRequestNotification(r) {
     const [lon, lat] = r.geometry.coordinates;
     const links = buildLinks({ lat, lon }, []);
-    const type = updateRequestTypeName(r.updateRequestType);
+    const type = r.updateRequestType ? updateRequestTypeName(r.updateRequestType) : (r.typeText || "Update request");
     const sev = severityLabel(r.severity);
     const src = updateRequestSourceName(r.source);
     const reported = toDiscordUnix(r.reportedOn);
@@ -1408,56 +1455,49 @@
     };
   }
 
-  // Read the WME Issue Tracker's active Update Requests filter and return a
-  // warning string if that filter would keep the scan from seeing open URs, else
-  // null. Note: getActiveFilters() reports `updateRequests: null` both when the
-  // group is toggled OFF (nothing is fetched) and when the status filter is the
-  // neutral "Both" (everything is fetched) — the SDK can't distinguish them, so
-  // null is treated as "fine" here and the empty-group case is covered by the
-  // persistent UI hint under the detector toggle instead.
-  function updateRequestsFilterWarning() {
-    let ur;
-    try { ur = sdk.IssueTracker.getActiveFilters().updateRequests; } catch (e) { return null; }
-    if (ur && ur.status === "CLOSED") {
-      return "WME's Issue Tracker is filtered to CLOSED update requests — the scan won't see open ones. Set the Update Requests status filter to Both (or Open).";
-    }
-    return null;
-  }
-
   // ---------------------------------------------------------------------------
   // Map suggestion detector ("Map Suggestions")
   // ---------------------------------------------------------------------------
-  // Scans WME's edit suggestions (sdk.DataModel.EditSuggestions) — Google/system
-  // suggested edits awaiting review. Same load-gating as update requests: WME
-  // only loads them when the Map Suggestions group is on in the Issue Tracker
-  // filter panel (see mapSuggestionsFilterWarning). These have no Point geometry,
-  // only a bbox, so region filtering tests the bbox against the scan polygon.
+  // Open map suggestions awaiting review: edit suggestions (suggested changes to
+  // existing objects, region-tested by their bbox) and, unless turned off,
+  // segment suggestions (proposed new roads, region-tested by their line).
   const SUGGESTION_OPEN_STATUSES = new Set(["OPEN", "OPEN_AND_CLOSED"]);
   function makeSuggestionDetector() {
-    const suggestionsById = new Map(); // dedupe across tiles
+    const suggestionsById = new Map(); // "edit:<id>" / "segment:<id>" -> item
+    const withSegments = settings.detectors.suggestion.includeSegments !== false;
     return {
       key: "suggestion",
-      collect() {
-        const list = sdk.DataModel.EditSuggestions.getAll();
-        for (const s of list) {
-          if (suggestionsById.has(s.id)) continue;             // cross-tile dedupe
+      collect(reply, tile) {
+        for (const m of (reply.editSuggestions && reply.editSuggestions.objects) || []) {
+          const s = normalizeEditSuggestion(m);
+          const key = "edit:" + s.id;
+          if (suggestionsById.has(key)) continue;               // cross-tile dedupe
           if (!SUGGESTION_OPEN_STATUSES.has(s.status)) continue; // only open ones
           const box = normBbox(s.bbox);
           if (!box || box.length < 4) continue;
-          if (!bboxInPolygon(box, scanState.polygon)) continue;  // region filter
-          suggestionsById.set(s.id, s);
+          if (!tile.inside && !scanState.region.boxIn(box)) continue; // region filter
+          suggestionsById.set(key, { kind: "edit", item: s });
+        }
+        if (!withSegments) return;
+        for (const m of (reply.segmentSuggestions && reply.segmentSuggestions.objects) || []) {
+          const s = normalizeSegmentSuggestion(m);
+          const key = "segment:" + s.id;
+          if (suggestionsById.has(key)) continue;
+          if (!SUGGESTION_OPEN_STATUSES.has(s.status)) continue;
+          const coords = s.geometry && s.geometry.coordinates;
+          if (!coords || !coords.length) continue;
+          if (!tile.inside && !scanState.region.lineIn(coords)) continue;
+          suggestionsById.set(key, { kind: "segment", item: s });
         }
       },
       async finalize() {
-        const items = [...suggestionsById.values()];
         const store = seenFor(settings.region, "suggestion");
-        const fresh = items.filter((s) => !store.ids.has(String(s.id)));
-        for (const s of items) store.ids.add(String(s.id));
+        const fresh = [...suggestionsById.entries()].filter(([key]) => !store.ids.has(key));
+        for (const key of suggestionsById.keys()) store.ids.add(key);
         if (!store.baseline) { store.baseline = true; return 0; } // silent first scan
-        if (!fresh.length) return 0;
         let sent = 0;
-        for (const s of fresh) {
-          const note = buildSuggestionNotification(s);
+        for (const [, { kind, item }] of fresh) {
+          const note = kind === "edit" ? buildSuggestionNotification(item) : buildSegmentSuggestionNotification(item);
           const results = await sendNotification("suggestion", note);
           if (results.some((x) => x.endsWith(":ok"))) sent++;
         }
@@ -1468,7 +1508,7 @@
 
   function buildSuggestionNotification(s) {
     const [lon, lat] = bboxCenter(normBbox(s.bbox));
-    const links = buildLinks({ lat, lon }, []);
+    const links = buildLinks({ lat, lon }, [], normBbox(s.bbox));
     const src = editSuggestionSourceName(s.source);
     const created = toDiscordUnix(s.modificationData && s.modificationData.createdOn);
 
@@ -1493,16 +1533,29 @@
     };
   }
 
-  // Warn if the Issue Tracker's Map Suggestions filter would hide open ones.
-  // Status "OPEN" (only open) and null (neutral/off) are fine; any other single
-  // status (CLOSED_ALL, REJECTED_ALL, APPROVED_BY_GOOGLE, …) excludes open ones.
-  function mapSuggestionsFilterWarning() {
-    let ms;
-    try { ms = sdk.IssueTracker.getActiveFilters().mapSuggestions; } catch (e) { return null; }
-    if (ms && ms.status && ms.status !== "OPEN") {
-      return `WME's Issue Tracker is filtered to "${ms.status}" map suggestions — the scan won't see open ones. Set the Map Suggestions status filter to Open (or neutral).`;
+  function buildSegmentSuggestionNotification(s) {
+    const box = bboxOfRing(s.geometry.coordinates);
+    const centroid = centroidOfBbox(box);
+    const links = buildLinks(centroid, [], padBbox(box, 0.15));
+    const src = editSuggestionSourceName(s.source);
+    const created = toDiscordUnix(s.createdOn);
+    const road = [s.streetName || "Unnamed road", s.roadType != null ? roadTypeName(s.roadType) : null].filter(Boolean).join(" — ");
+    const where = s.cityName ? ` in ${s.cityName}` : "";
+
+    const md = [`**New road:** ${road}${where}`];
+    const plain = [`New road: ${road}${where}`];
+    if (src) { md.push(`**Source:** ${src}`); plain.push(`Source: ${src}`); }
+    if (created) {
+      md.push(`**Created:** <t:${created}:F> (<t:${created}:R>)`);
+      plain.push(`Created: ${new Date(created * 1000).toLocaleString()}`);
     }
-    return null;
+
+    return {
+      title: "Map suggestion: New road",
+      color: COLORS.suggestion,
+      discordDescription: `${md.join("\n")}\n\n${linksMarkdown(links)}`,
+      plainText: `Map suggestion\n${plain.join("\n")}\n\n${linksPlain(links)}`,
+    };
   }
 
   // ---------------------------------------------------------------------------
@@ -1521,6 +1574,7 @@
   // still reported regardless — accepting here only forgoes waiting for one that
   // has not appeared in the endpoint yet.)
   const EDIT_CAUGHT_UP_GRACE_MS = 20000;
+  const EDIT_SAVE_EVERY_MS = 5000; // checkpoint save throttle while reading histories
   let editStatus = "Not scanned yet.";
 
   function editTime(value) {
@@ -1530,10 +1584,7 @@
   }
 
   function editEndpoint() {
-    const region = sdk.Settings.getRegionCode();
-    const bases = { usa: "/Descartes/app", row: "/row-Descartes/app", il: "/il-Descartes/app" };
-    if (!bases[region]) throw new Error("Unknown WME server region");
-    return new URL(bases[region] + "/ElementHistory", PAGE.location.origin);
+    return new URL(apiBase() + "/ElementHistory");
   }
 
   async function fetchEditHistory(endpoint, item, cursor) {
@@ -1552,13 +1603,17 @@
     } finally { clearTimeout(timer); }
   }
 
-  function editGeometryInRegion(geometry, polygon) {
+  // `region` is an indexPolygon() index of the scan area.
+  function editGeometryInRegion(geometry, region) {
     if (!geometry) return false;
-    if (geometry.type === "Point") return pointInPolygon(geometry.coordinates, polygon);
-    if (geometry.type === "LineString") return lineInPolygon(geometry.coordinates, polygon);
+    if (geometry.type === "Point") return region.pointIn(geometry.coordinates);
+    if (geometry.type === "LineString") return region.lineIn(geometry.coordinates);
     if (geometry.type === "Polygon") {
-      return geometry.coordinates.some((ring) => lineInPolygon(ring, polygon)) ||
-        polygon[0].some((pt) => pointInPolygon(pt, geometry.coordinates));
+      if (geometry.coordinates.some((ring) => region.lineIn(ring))) return true;
+      // Neither touches the other's boundary: the region can only overlap by
+      // lying wholly inside the place, so testing one region vertex is enough.
+      const box = geometryBbox(geometry);
+      return !!box && pointInBox(region.firstPoint, box) && pointInPolygon(region.firstPoint, geometry.coordinates);
     }
     return false;
   }
@@ -1638,9 +1693,7 @@
   // Base WME permalink for the current map view, stripped of any object
   // selection so we can append a single segment/place per link below.
   function editPermalinkBase() {
-    let base;
-    try { base = sdk.Map.getPermalink(); } catch (e) { return "https://www.waze.com/editor"; }
-    return base
+    return wme.permalink // cached by refreshWmeInfo()
       .replace(/([?&])(segments|venues)=[^&]*/g, "$1")
       .replace(/&&+/g, "&").replace(/\?&/, "?").replace(/[?&]$/, "");
   }
@@ -1743,22 +1796,20 @@
     let missingMetadata = 0;
     return {
       key: "edit",
-      collect() {
-        if (sdk.Editing.getUnsavedChangesCount() > 0) throw new Error("Save or undo local edits before scanning User edits");
-        const modules = [["segment", sdk.DataModel.Segments]];
-        if (!settings.global.skipPlaces) modules.push(["venue", sdk.DataModel.Venues]);
-        for (const [type, module] of modules) {
-          for (const object of module.getAll()) {
+      collect(reply, tile) {
+        const lists = [["segment", (reply.segments && reply.segments.objects) || []]];
+        if (!settings.global.skipPlaces) lists.push(["venue", (reply.venues && reply.venues.objects) || []]);
+        for (const [type, objects] of lists) {
+          for (const object of objects) {
             const id = String(object.id);
             if (!id || id.startsWith("-")) continue;
-            const md = object.modificationData;
-            if (!md || !(md.updatedOn || md.createdOn)) { missingMetadata++; continue; }
-            const item = { type, id, time: editTime(md.updatedOn || md.createdOn) };
+            if (!(object.updatedOn || object.createdOn)) { missingMetadata++; continue; }
+            const item = { type, id, time: editTime(object.updatedOn || object.createdOn) };
             const objectKey = type + ":" + id;
-            // SDK merge events repeatedly expose the same loaded objects. Do
-            // the potentially expensive polygon intersection only for new versions.
+            // Objects crossing a tile edge come back in each tile. Do the
+            // potentially expensive polygon intersection only for new versions.
             if (collected.has(objectKey) && collected.get(objectKey).time >= item.time) continue;
-            if (!editGeometryInRegion(object.geometry, scanState.polygon)) continue;
+            if (!tile.inside && !editGeometryInRegion(object.geometry, scanState.region)) continue;
             item.bbox = geometryBbox(object.geometry); // for permalinks that land on and fit the object
             if (!collected.has(objectKey) || collected.get(objectKey).time < item.time) collected.set(objectKey, item);
           }
@@ -1780,6 +1831,12 @@
         persist();
         const budget = { remaining: 25 };
         let failures = 0, processed = 0, lastError = "";
+        // The store holds a checkpoint per object in the region, so writing it is
+        // slow; checkpoints are saved at most every few seconds and once after
+        // the loop. A crash in between only re-reads those histories next scan
+        // (pending events are deduped), and delivery still saves immediately.
+        let savedAt = Date.now();
+        const persistSoon = () => { if (Date.now() - savedAt >= EDIT_SAVE_EVERY_MS) { persist(); savedAt = Date.now(); } };
         const total = Object.keys(store.retry).length;
         for (const [id, item] of Object.entries(store.retry)) {
           if (!scanState.running || budget.remaining <= 0) break;
@@ -1788,8 +1845,6 @@
             const checkpoint = store.checkpoints[id] || { time: store.baselineAt, ids: [], baseline: true };
             // An old object discovered later is silently baselined.
             const result = item.time <= checkpoint.time ? { events: [], checkpoint } :
-              // Commit progress once per object (including paused/failed work),
-              // rather than stringifying the entire area store after every page.
               await readNewEditEvents(endpoint, item, checkpoint, budget);
             for (const event of result.events) {
               noteUsername(event.name);
@@ -1799,17 +1854,18 @@
             }
             store.checkpoints[id] = result.checkpoint;
             delete store.retry[id];
-            persist();
+            persistSoon();
           } catch (e) {
             if (e.editStorageFailure) throw e;
             failures++; lastError = e.message;
             console.warn(`[WME Auto Scan] ${id}: ${e.message}`);
             // Move a failing object to the end so it cannot starve the queue.
             delete store.retry[id]; store.retry[id] = item;
-            persist();
+            persistSoon();
             if (/HTTP (401|403|429)|Unrecognized history/.test(e.message)) break;
           }
         }
+        persist();
         const sent = await deliverEditEvents(store, persist);
         const waiting = Object.values(store.pending).reduce((n, events) => n + events.length, 0);
         setEditStatus(`${sent} user summaries sent; ${waiting} edits awaiting cooldown/delivery; ${Object.keys(store.retry).length} histories pending.${failures ? " " + lastError : ""}${missingMetadata ? " Some objects lack metadata." : ""}`);
@@ -1826,11 +1882,12 @@
     scheduled: false, // interval loop active
     polygon: null, // GeoJSON Polygon coordinates
     intervalTimer: null,
+    api: null, // the running scan's API client (aborted on Stop)
     tilesDone: 0,
     tilesTotal: 0,
     startTime: 0, // ms timestamp the current scan began
     nextScanAt: 0, // ms timestamp the next scheduled scan will start
-    passLabel: "", // which scan pass is running ("roads" / "issues")
+    passLabel: "", // which scan pass is running
   };
 
   function activeDetectors() {
@@ -1842,181 +1899,85 @@
     return out;
   }
 
-  // --- Deterministic tile grid --------------------------------------------
-  // A fixed grid over the region's bbox in lon × Mercator-Y, so a cell index
-  // means the same place across sessions and the optimize mask (a set of
-  // productive cell indices) stays valid. Cells tile the area with no overlap.
-  // Each is visited from its center, where the box WME loads is slightly larger
-  // than the cell (TILE_MARGIN) — and every visit verifies that it covers it.
-  function computeGrid(polygon, span, zoom) {
-    const b = bboxOfRing(polygon[0]);
-    const x0 = b[0], y0 = mercY(b[1]);
-    const stepX = span.w * TILE_MARGIN, stepY = span.h * TILE_MARGIN;
-    const cols = Math.max(1, Math.ceil((b[2] - x0) / stepX));
-    const rows = Math.max(1, Math.ceil((mercY(b[3]) - y0) / stepY));
-    return { version: 2, x0, y0, stepX, stepY, cols, rows, zoom };
-  }
-
-  function gridCellCenter(grid, index) {
-    const col = index % grid.cols, row = Math.floor(index / grid.cols);
-    return { lon: grid.x0 + (col + 0.5) * grid.stepX, lat: latOfMercY(grid.y0 + (row + 0.5) * grid.stepY) };
-  }
-
-  function gridCellBox(grid, index) {
-    const col = index % grid.cols, row = Math.floor(index / grid.cols);
-    return [
-      grid.x0 + col * grid.stepX, latOfMercY(grid.y0 + row * grid.stepY),
-      grid.x0 + (col + 1) * grid.stepX, latOfMercY(grid.y0 + (row + 1) * grid.stepY),
-    ];
-  }
-
-  // Which grid cell contains a given lon/lat (-1 if off-grid).
-  function cellIndexOf(grid, lon, lat) {
-    const col = Math.floor((lon - grid.x0) / grid.stepX);
-    const row = Math.floor((mercY(lat) - grid.y0) / grid.stepY);
-    if (col < 0 || col >= grid.cols || row < 0 || row >= grid.rows) return -1;
-    return row * grid.cols + col;
-  }
-
-  // Indices of every grid cell that overlaps the polygon — exact and fast. A
-  // cell overlaps the region iff its center is inside the polygon (interior) or
-  // the boundary passes through it (coast); the second set is found by walking
-  // each boundary edge through the grid rather than sampling points along it.
-  function relevantCells(grid, polygon) {
-    const total = grid.cols * grid.rows;
-    const inside = new Uint8Array(total);
-    for (let i = 0; i < total; i++) {
-      const c = gridCellCenter(grid, i);
-      if (pointInPolygon([c.lon, c.lat], polygon)) inside[i] = 1;
+  // --- Scan passes ---------------------------------------------------------
+  // Each pass requests only what its detectors read, in boxes sized to that
+  // data's server limit:
+  //   closures — closures-only replies (~16× smaller than with roads), 1° boxes
+  //   edits    — every road type (+ places), boxes under the street cut-off
+  //   issues   — Update Requests + Map Suggestions from the Issue Tracker search
+  function plannedPasses(keys = null) {
+    const d = settings.detectors;
+    const on = keys || Object.keys(d).filter((k) => d[k].enabled);
+    const polygon = settings.region && settings.region.coordinates;
+    if (!polygon) return [];
+    const passes = [];
+    if (on.includes("closure")) {
+      passes.push({
+        label: "closures", keys: ["closure"], tiles: regionTiles(polygon, CLOSURE_TILE_DEG),
+        // An over-large box comes back with every list empty and no userAreas
+        // key, which every real reply carries (even over open ocean).
+        fetch: (api, tile) => api.features(tile.box, { roadClosures: true }),
+        refused: (reply, tile) => !("userAreas" in reply) && tile.box[2] - tile.box[0] > CLOSURE_MIN_TILE_DEG,
+      });
     }
-    const mark = (i) => { inside[i] = 1; };
-    for (const ring of polygon) markLineCells(grid, ring, mark);
-    const out = [];
-    for (let i = 0; i < total; i++) if (inside[i]) out.push(i);
-    return out;
-  }
-
-  // Call mark(index) for every grid cell a [lon, lat] polyline passes through.
-  // Long edges are split first: the grid walk follows a straight line in
-  // Mercator, which drifts from the straight lon/lat edge over many cells.
-  function markLineCells(grid, coords, mark) {
-    for (let k = 0; k < coords.length - 1; k++) {
-      const a = coords[k], b = coords[k + 1];
-      const n = Math.max(1, Math.ceil(Math.max(
-        Math.abs(b[0] - a[0]) / grid.stepX, Math.abs(mercY(b[1]) - mercY(a[1])) / grid.stepY) * 4));
-      let prev = a;
-      for (let t = 1; t <= n; t++) {
-        const next = t === n ? b : [a[0] + ((b[0] - a[0]) * t) / n, a[1] + ((b[1] - a[1]) * t) / n];
-        markEdgeCells(grid, prev, next, mark);
-        prev = next;
-      }
+    if (on.includes("edit")) {
+      const places = settings.global.skipPlaces ? {} : { venueLevel: 4, venueFilter: "1,1,1,1" };
+      passes.push({
+        label: "edits", keys: ["edit"], tiles: regionTiles(polygon, ROAD_TILE_DEG),
+        fetch: (api, tile) => api.features(tile.box, { roadTypes: ALL_ROAD_TYPES, ...places }),
+      });
     }
+    const issueKeys = on.filter((k) => k === "report" || k === "suggestion");
+    if (issueKeys.length) passes.push(issuePass(issueKeys, polygon));
+    return passes;
   }
 
-  // Call mark(index) for every grid cell the straight edge a→b ([lon, lat])
-  // passes through (a grid walk; both neighbours are marked at exact corners).
-  function markEdgeCells(grid, a, b, mark) {
-    const ax = (a[0] - grid.x0) / grid.stepX, ay = (mercY(a[1]) - grid.y0) / grid.stepY;
-    const bx = (b[0] - grid.x0) / grid.stepX, by = (mercY(b[1]) - grid.y0) / grid.stepY;
-    let cx = Math.floor(ax), cy = Math.floor(ay);
-    const ex = Math.floor(bx), ey = Math.floor(by);
-    const dx = bx - ax, dy = by - ay;
-    const sx = dx > 0 ? 1 : -1, sy = dy > 0 ? 1 : -1;
-    const tdx = dx !== 0 ? Math.abs(1 / dx) : Infinity;
-    const tdy = dy !== 0 ? Math.abs(1 / dy) : Infinity;
-    let tx = dx !== 0 ? (dx > 0 ? cx + 1 - ax : ax - cx) * tdx : Infinity;
-    let ty = dy !== 0 ? (dy > 0 ? cy + 1 - ay : ay - cy) * tdy : Infinity;
-    const cell = (c, r) => { if (c >= 0 && c < grid.cols && r >= 0 && r < grid.rows) mark(r * grid.cols + c); };
-    cell(cx, cy);
-    for (let n = Math.abs(ex - cx) + Math.abs(ey - cy); n > 0; n--) {
-      if (tx < ty) { cx += sx; tx += tdx; }
-      else if (ty < tx) { cy += sy; ty += tdy; }
-      else { cell(cx + sx, cy); cell(cx, cy + sy); cx += sx; cy += sy; tx += tdx; ty += tdy; n--; }
-      cell(cx, cy);
-    }
-    cell(ex, ey);
-  }
-
-  // Split a tile into quarters at `zoom` (same zoom when WME's box didn't cover
-  // it; one zoom closer when an Issue Tracker response looked capped).
-  function quarters(tile, zoom, coverDepth) {
-    const [x1, y1, x2, y2] = [tile.rect[0], mercY(tile.rect[1]), tile.rect[2], mercY(tile.rect[3])];
-    const xm = (x1 + x2) / 2, ym = (y1 + y2) / 2;
-    return [[x1, y1, xm, ym], [xm, y1, x2, ym], [x1, ym, xm, y2], [xm, ym, x2, y2]].map(([l, b, r, t]) => ({
-      rect: [l, latOfMercY(b), r, latOfMercY(t)],
-      center: { lon: (l + r) / 2, lat: latOfMercY((b + t) / 2) },
-      zoom,
-      coverDepth,
-    }));
-  }
-
-  function tileFor(grid, index) {
-    return { center: gridCellCenter(grid, index), rect: gridCellBox(grid, index), zoom: grid.zoom, coverDepth: 0 };
-  }
-
-  // Load one tile exactly, then onLoaded(tile, result) while its data is in the
-  // model. Splits the tile when WME's box doesn't cover it (the window shrank
-  // since the grid was laid out), or when its result count reaches the level its
-  // parent hit — the sign that a capped response is hiding the rest.
-  // Resolves false if the run was stopped.
-  async function visitTile(tracker, pass, tile, onLoaded) {
-    const res = await tracker.visit(tile, pass.kind);
-    if (!res) return false;
-    let children = null;
-    const where = () => `zoom ${tile.zoom} near ${tile.center.lat.toFixed(5)},${tile.center.lon.toFixed(5)}`;
-    if (res.uncovered) {
-      if (tile.coverDepth >= MAX_SPLIT_DEPTH) {
-        throw new Error("The map window is too small for this scan grid. Enlarge the window or re-optimize. Scan stopped; baseline was not updated.");
-      }
-      children = quarters(tile, tile.zoom, tile.coverDepth + 1);
-      children.forEach((child) => { child.splitFloor = tile.splitFloor; });
-    } else {
-      onLoaded(tile, res);
-      const counts = res.counts || {};
-      const floors = tile.splitFloor || [];
-      const sums = (pass.splitGroups || []).map((group) => group.keys.reduce((n, k) => n + (Number(counts[k]) || 0), 0));
-      if (sums.length && pass.recordTile) pass.recordTile(tile, sums);
-      // A quarter that returns as much as the parent it came from is hiding the
-      // same cap, so it splits again; anything smaller is complete.
-      const suspect = sums.map((n, g) => n >= (floors[g] ?? ISSUE_SPLIT_AT));
-      if (suspect.some(Boolean)) {
-        if (tile.zoom < MAX_SPLIT_ZOOM) {
-          children = quarters(tile, tile.zoom + 1, 0);
-          const childFloors = sums.map((n, g) => (suspect[g] ? n : Infinity));
-          children.forEach((child) => { child.splitFloor = childFloors; });
-        } else {
-          console.warn(`[WME Auto Scan] ${sums.join(" / ")} Issue Tracker results at ${where()}; some may be missing.`);
+  // Fetch every tile of a pass, MAX_PARALLEL at a time, handing each reply to
+  // the pass's detectors. A tile the pass refuses (or splits) is replaced by its
+  // quarters. Any request that can't be completed fails the whole scan, so a
+  // partial scan never turns later discoveries into new alerts.
+  async function runPass(pass, detectors, api) {
+    const queue = pass.tiles.map((t) => ({ ...t }));
+    scanState.tilesTotal += queue.length;
+    let failure = null, inFlight = 0;
+    const worker = async () => {
+      while (!failure && scanState.running) {
+        if (!queue.length) {
+          if (!inFlight) return;
+          await sleep(50);
+          continue;
+        }
+        const tile = queue.shift();
+        inFlight++;
+        try {
+          const reply = await pass.fetch(api, tile);
+          let children = null;
+          if (pass.refused && pass.refused(reply, tile)) {
+            children = quarterTiles(tile);
+          } else {
+            const users = userNames(reply);
+            for (const det of detectors) det.collect(reply, tile, users);
+            if (pass.split) children = pass.split(reply, tile);
+          }
+          // Let the page handle input and redraw between replies.
+          await yieldToPage();
+          if (children && children.length) {
+            queue.unshift(...children);
+            scanState.tilesTotal += children.length;
+          }
+          scanState.tilesDone++;
+        } catch (e) {
+          failure = failure || e;
+        } finally {
+          inFlight--;
         }
       }
-    }
-    if (!children) return true;
-    for (const child of children) {
-      if (!await visitTile(tracker, pass, child, onLoaded)) return false;
-    }
-    return true;
+    };
+    await Promise.all(Array.from({ length: MAX_PARALLEL }, worker));
+    if (failure) throw failure;
+    return scanState.running;
   }
 
-  // Credit every region cell a real (non-offroad) road passes through, from the
-  // segments now in the data model. Crossings count, not just vertices, so a
-  // long straight road marks every cell it runs through.
-  function creditRoadCells(grid, cellSet, found) {
-    let segs = [];
-    try { segs = sdk.DataModel.Segments.getAll(); } catch (e) { return; }
-    const mark = (i) => { if (cellSet.has(i)) found.add(i); };
-    for (const s of segs) {
-      if (OFFROAD_ROAD_TYPES.has(s.roadType)) continue;
-      const coords = s.geometry && s.geometry.coordinates;
-      if (!coords || !coords.length) continue;
-      if (coords.length === 1) {
-        const i = cellIndexOf(grid, coords[0][0], coords[0][1]);
-        if (i >= 0) mark(i);
-        continue;
-      }
-      markLineCells(grid, coords, mark);
-    }
-  }
-
-  // --- Optimization mask storage (one GM key per region) -------------------
   function regionKey(region) {
     const s = JSON.stringify((region && region.coordinates) || []);
     let h = 0;
@@ -2024,69 +1985,8 @@
     return "r" + (h >>> 0).toString(36) + "_" + s.length;
   }
 
-  function loadMask(region) {
-    try {
-      const raw = GM_getValue(MASK_STORAGE_PREFIX + regionKey(region), null);
-      if (!raw) return null;
-      const mask = typeof raw === "string" ? JSON.parse(raw) : raw;
-      return mask && mask.grid && mask.grid.version === 2 ? mask : null;
-    } catch (e) { return null; }
-  }
-
-  function saveMask(region, mask) {
-    try {
-      GM_setValue(MASK_STORAGE_PREFIX + regionKey(region), JSON.stringify(mask));
-    } catch (e) { console.error("[WME Auto Scan] failed to save mask", e); }
-  }
-
-  function clearMask(region) {
-    try { GM_setValue(MASK_STORAGE_PREFIX + regionKey(region), null); } catch (e) {}
-  }
-
-  function maskIsStale(mask) {
-    if (!mask || !mask.builtAt) return false;
-    return Date.now() - Date.parse(mask.builtAt) > MASK_STALE_DAYS * 86400000;
-  }
-
-  // --- Request box size ----------------------------------------------------
-  // WME's roads request covers more than the viewport (a server-configured
-  // buffer, 1.7× per side by default). A pass measures the real box once; the
-  // ratio to the viewport is remembered so previews can estimate the grid
-  // without moving the map.
-  function loadBoxRatios() {
-    try {
-      const raw = GM_getValue(BOX_RATIO_KEY, null);
-      return raw ? (typeof raw === "string" ? JSON.parse(raw) : raw) : {};
-    } catch (e) { return {}; }
-  }
-
-  function rememberBoxRatio(kind, box) {
-    try {
-      const view = mercSpan(sdk.Map.getMapExtent());
-      const req = mercSpan(box);
-      const ratio = Math.min(req.w / view.w, req.h / view.h);
-      if (!(ratio > 0)) return;
-      GM_setValue(BOX_RATIO_KEY, JSON.stringify({ ...loadBoxRatios(), [kind]: ratio }));
-    } catch (e) {}
-  }
-
-  // Box WME loads per visit at `zoom`, estimated from the current view.
-  function estimatedSpan(kind, zoom) {
-    const view = mercSpan(sdk.Map.getMapExtent());
-    const scale = Math.pow(2, sdk.Map.getZoomLevel() - zoom) * (loadBoxRatios()[kind] || 1);
-    return { w: view.w * scale, h: view.h * scale };
-  }
-
-  // Lay out a pass's grid from one visit at the region's center at `zoom`.
-  async function measureGrid(tracker, kind, zoom, polygon) {
-    const res = await tracker.visit({ center: centroidOfBbox(bboxOfRing(polygon[0])), zoom, rect: null }, kind);
-    if (!res) return null;
-    rememberBoxRatio(kind, res.box);
-    return computeGrid(polygon, mercSpan(res.box), zoom);
-  }
-
   // --- Run-duration timing (one GM key per region) -------------------------
-  // Persists how long the last scan / optimize of a region took, so we can show
+  // Persists how long the last scan of a region took, so we can show
   // "(Last scan …)" and estimate the remaining time of an in-progress run.
   const TIMING_STORAGE_PREFIX = "wme-auto-scan:timing:v1:";
   function loadTiming(region) {
@@ -2116,273 +2016,27 @@
     return `${s}s`;
   }
 
-  // Remaining time for the current run: prefer the previous run's duration for
-  // this region; fall back to extrapolating from progress so far.
-  function estimateRemaining(kind, elapsedMs, done, total) {
-    const t = settings.region ? loadTiming(settings.region) : null;
-    const prev = t && (kind === "scan" ? t.lastScanMs : t.lastOptimizeMs);
-    if (prev != null && prev > 0) return Math.max(0, prev - elapsedMs);
+  // Remaining time for the current run: extrapolate from requests done so far,
+  // falling back to the previous run's duration before any have finished.
+  function estimateRemaining(elapsedMs, done, total) {
     if (done > 0 && total > 0) return Math.max(0, (elapsedMs / done) * total - elapsedMs);
+    const t = settings.region ? loadTiming(settings.region) : null;
+    if (t && t.lastScanMs > 0) return Math.max(0, t.lastScanMs - elapsedMs);
     return null;
   }
 
-  // --- Optimize pass -------------------------------------------------------
-  const optimizeState = { running: false, cancel: false, done: 0, total: 0, productive: 0, startTime: 0 };
-
-  async function runOptimize() {
-    if (optimizeState.running || scanState.running) return;
-    if (!settings.region || !settings.region.coordinates) {
-      setStatus("Choose a scan area before optimizing.");
-      return;
-    }
-    optimizeState.running = true;
-    optimizeState.cancel = false;
-    optimizeState.startTime = Date.now();
-    const region = settings.region;
-    const polygon = region.coordinates;
-    const originalCenter = sdk.Map.getMapCenter();
-    const originalZoom = sdk.Map.getZoomLevel();
-    refreshUI();
-
-    let tracker = null;
-    try {
-      tracker = createLoadTracker(() => optimizeState.cancel);
-      showOnlyLayers(["roads", "paths"]);
-
-      // Resume an in-progress mask on its own grid (visits verify coverage, so a
-      // different window size is fine), else measure a fresh grid.
-      let mask = loadMask(region);
-      const found = new Set();
-      let grid, cells, startAt;
-      if (mask && !mask.complete && Array.isArray(mask.cells) && mask.grid.zoom === ROADS_ZOOM) {
-        grid = mask.grid;
-        cells = mask.cells;
-        startAt = mask.nextIndex || 0;
-        (mask.productive || []).forEach((i) => found.add(i));
-      } else {
-        grid = await measureGrid(tracker, "features", ROADS_ZOOM, polygon);
-        if (!grid) { setStatus("Optimization stopped."); return; }
-        cells = relevantCells(grid, polygon);
-        startAt = 0;
-        mask = { version: 2, grid, cells, productive: [], total: cells.length, nextIndex: 0, complete: false, builtAt: null };
-        saveMask(region, mask);
-      }
-      const cellSet = new Set(cells);
-      optimizeState.total = cells.length;
-      optimizeState.done = startAt;
-      const productiveCount = () => { let n = 0; for (const i of found) if (cellSet.has(i)) n++; return n; };
-      const persist = () => { mask.productive = cells.filter((i) => found.has(i)); saveMask(region, mask); };
-      const pass = { kind: "features" };
-      const credit = () => creditRoadCells(grid, cellSet, found);
-
-      let finished = true;
-      for (let i = startAt; i < cells.length; i++) {
-        const idx = cells[i];
-        // A cell a neighbour's response already showed a road in needs no visit;
-        // only a cell that might be empty has to be loaded to prove it.
-        if (!found.has(idx) && !await visitTile(tracker, pass, tileFor(grid, idx), credit)) { finished = false; break; }
-        mask.nextIndex = i + 1;
-        optimizeState.done = i + 1;
-        if (i % OPTIMIZE_SAVE_EVERY === 0 || i === cells.length - 1) {
-          optimizeState.productive = productiveCount();
-          persist();
-        }
-      }
-
-      persist();
-      if (finished && !optimizeState.cancel) {
-        mask.complete = true;
-        mask.builtAt = new Date().toISOString();
-        saveMask(region, mask);
-        saveTiming(region, { lastOptimizeMs: Date.now() - optimizeState.startTime });
-        setStatus(`Optimization complete: ${productiveCount()}/${cells.length} areas have roads. Future scans will skip the others.`);
-      } else {
-        setStatus(`Optimization paused at ${mask.nextIndex}/${cells.length}. You can resume it later.`);
-      }
-    } catch (e) {
-      console.error("[WME Auto Scan] optimize failed", e);
-      setStatus("Optimization failed: " + e.message);
-    } finally {
-      if (tracker) tracker.disconnect();
-      restoreLayers();
-      try { sdk.Map.setMapCenter({ lonLat: originalCenter, zoomLevel: originalZoom }); } catch (e) {}
-      optimizeState.running = false;
-      refreshUI();
-    }
-  }
-
-  function stopOptimize() {
-    optimizeState.cancel = true;
-  }
-
-  // --- Scan passes ---------------------------------------------------------
-  // Detector groups read different WME requests, so each group gets its own
-  // pass at the zoom where its data loads, with only its layers shown:
-  //   roads  — closures + user edits, from the roads request at ROADS_ZOOM,
-  //            over the optimized cells when a mask exists.
-  //   issues — Update Requests + Map Suggestions, from the Issue Tracker search
-  //            WME makes from ISSUES_ZOOM up (64× the area per tile of zoom 15).
-  //            Never masked: "missing road" reports sit where there is no road.
-  function scanPasses(detectors) {
-    const has = (key) => detectors.some((d) => d.key === key);
-    const passes = [];
-    const roads = detectors.filter((d) => d.key === "closure" || d.key === "edit");
-    if (roads.length) {
-      const layers = ["roads", "paths"];
-      if (has("closure")) layers.push("closures");
-      if (has("edit") && !settings.global.skipPlaces) layers.push("places");
-      passes.push({ label: "roads", kind: "features", zoom: ROADS_ZOOM, detectors: roads, layers, useMask: true, splitGroups: null });
-    }
-    const issues = detectors.filter((d) => d.key === "report" || d.key === "suggestion");
-    if (issues.length) {
-      const layers = [], splitGroups = [];
-      if (has("report")) {
-        layers.push("updateRequests");
-        splitGroups.push({ label: "Update Request", keys: ["mapUpdateRequestsCount"], ids: () => sdk.DataModel.MapUpdateRequests.getAll().map((r) => String(r.id)) });
-      }
-      if (has("suggestion")) {
-        layers.push("editSuggestions");
-        splitGroups.push({ label: "Map Suggestion", keys: ["editProposalsCount", "segmentSuggestionsCount"], ids: () => sdk.DataModel.EditSuggestions.getAll().map((x) => String(x.id)) });
-      }
-      passes.push({ label: "issues", kind: "issues", zoom: ISSUES_ZOOM, detectors: issues, layers, useMask: false, splitGroups });
-    }
-    return passes;
-  }
-
-  // Groups WME searches on every tile but nothing here reads: the SDK can't turn
-  // them off (only their marker layers, which doesn't stop the search), so say so.
-  function noteSpareIssueGroups(request) {
-    if (!request.spareGroups || !request.spareGroups.length) return;
-    const msg = `${request.spareGroups.join(" and ")} are on in WME's Issue Tracker filters. Turning them off there makes scans noticeably faster — nothing here reads them.`;
-    console.warn("[WME Auto Scan] " + msg);
-    setStatus(msg);
-  }
-
-  // Issue Tracker groups the editor's filters exclude are never requested, so
-  // those detectors are skipped for this run instead of recording an empty
-  // baseline (which would later report every existing item as new).
-  function hiddenIssueDetectors(pass, request) {
-    const hidden = [];
-    for (const [key, present, label] of [
-      ["report", request.hasUpdateRequests, "Update Requests"],
-      ["suggestion", request.hasSuggestions, "Map Suggestions"],
-    ]) {
-      if (present || !pass.detectors.some((d) => d.key === key)) continue;
-      hidden.push(key);
-      const msg = `${label} are turned off in WME's Issue Tracker filters, so this scan skipped them.`;
-      console.warn("[WME Auto Scan] " + msg);
-      setStatus(msg);
-    }
-    return hidden;
-  }
-
-  // Run one pass over its cells. Resolves false if the scan was stopped.
-  async function scanPass(pass, tracker, skipped) {
-    const polygon = scanState.polygon;
-    scanState.passLabel = pass.label;
-    showOnlyLayers(pass.layers);
-    const active = () => pass.detectors.filter((d) => !skipped.has(d.key));
-    const skipPass = (message) => {
-      pass.detectors.forEach((d) => skipped.add(d.key));
-      console.warn("[WME Auto Scan] " + message);
-      setStatus(message);
-      return true;
-    };
-
-    let grid, cells;
-    const mask = pass.useMask ? loadMask(settings.region) : null;
-    try {
-      if (mask && mask.complete && Array.isArray(mask.productive) && mask.grid.zoom === pass.zoom) {
-        grid = mask.grid;
-        cells = mask.productive;
-      } else {
-        grid = await measureGrid(tracker, pass.kind, pass.zoom, polygon);
-        if (!grid) return false;
-        cells = relevantCells(grid, polygon);
-      }
-    } catch (e) {
-      // No Issue Tracker search at all means its layer is off: skip, don't fail.
-      if (e.noLoad === "issues") return skipPass(e.message);
-      throw e;
-    }
-    scanState.tilesTotal += cells.length;
-
-    let checkedGroups = pass.kind !== "issues";
-    const onLoaded = (tile, res) => {
-      if (!checkedGroups) {
-        checkedGroups = true;
-        hiddenIssueDetectors(pass, res.request).forEach((key) => skipped.add(key));
-        noteSpareIssueGroups(res.request);
-      }
-      for (const det of active()) det.collect();
-    };
-    // Every visited tile's result counts and the ids it returned, so a capped
-    // response can be recognised afterwards.
-    const seenTiles = [];
-    pass.recordTile = (tile, sums) => {
-      const ids = (pass.splitGroups || []).map((group) => {
-        try { return new Set(group.ids()); } catch (e) { return new Set(); }
-      });
-      seenTiles.push({ tile, sums, ids });
-    };
-
-    const splitTile = async (entry, g) => {
-      for (const child of quarters(entry.tile, entry.tile.zoom + 1, 0)) {
-        child.splitFloor = entry.sums.map((n, i) => (i === g ? n : Infinity));
-        if (!await visitTile(tracker, pass, child, onLoaded)) return false;
-      }
-      return true;
-    };
-
-    // If the server capped any response in this pass, the cap is the largest
-    // count in it — so splitting the busiest tile settles the question for every
-    // tile. If its quarters return something the tile itself didn't, that count
-    // is the cap and every tile that reached it is re-checked; if they return
-    // nothing new, nothing in the pass was truncated.
-    const probeForCap = async () => {
-      const groups = pass.splitGroups || [];
-      for (let g = 0; g < groups.length; g++) {
-        let busiest = null;
-        for (const t of seenTiles) {
-          if (t.sums[g] < ISSUE_PROBE_MIN || t.tile.zoom >= MAX_SPLIT_ZOOM) continue;
-          if (!busiest || t.sums[g] > busiest.sums[g]) busiest = t;
-        }
-        if (!busiest) continue;
-        const cap = busiest.sums[g];
-        const from = seenTiles.length;
-        if (!await splitTile(busiest, g)) return false;
-        const hidden = seenTiles.slice(from).some((t) => [...t.ids[g]].some((id) => !busiest.ids[g].has(id)));
-        if (!hidden) continue;
-        const capped = seenTiles.slice(0, from).filter((t) => t !== busiest && t.sums[g] >= cap && t.tile.zoom < MAX_SPLIT_ZOOM);
-        console.warn(`[WME Auto Scan] WME capped ${groups[g].label} responses at ${cap} per area; re-checking ${capped.length} more area(s).`);
-        for (const t of capped) if (!await splitTile(t, g)) return false;
-      }
-      return true;
-    };
-
-    for (const idx of cells) {
-      if (!active().length) break;
-      if (!await visitTile(tracker, pass, tileFor(grid, idx), onLoaded)) return false;
-      scanState.tilesDone++;
-    }
-    return await probeForCap();
-  }
-
   async function runScan() {
-    if (scanState.running || optimizeState.running) return;
+    if (scanState.running) return;
     if (!settings.region || !settings.region.coordinates) {
       setStatus("Choose a scan area first.");
       return;
     }
     scanState.running = true;
     scanState.polygon = settings.region.coordinates;
+    scanState.region = indexPolygon(scanState.polygon);
     scanState.startTime = Date.now();
     scanState.tilesDone = 0;
     scanState.tilesTotal = 0;
-
-    // Remember the editor's view so we can restore it afterwards.
-    const originalCenter = sdk.Map.getMapCenter();
-    const originalZoom = sdk.Map.getZoomLevel();
 
     let detectors;
     try { detectors = activeDetectors(); }
@@ -2397,31 +2051,23 @@
       return;
     }
 
-    // Warn if the editor's Issue Tracker filters would starve a detector.
-    for (const [key, fn] of [["report", updateRequestsFilterWarning], ["suggestion", mapSuggestionsFilterWarning]]) {
-      if (!settings.detectors[key].enabled) continue;
-      const warn = fn();
-      if (warn) { console.warn("[WME Auto Scan] " + warn); setStatus(warn); }
-    }
-
-    let tracker = null;
+    const api = createApiClient(() => !scanState.running);
+    scanState.api = api;
     try {
-      tracker = createLoadTracker(() => !scanState.running);
-      const skipped = new Set(); // detectors this run couldn't scan
-      for (const pass of scanPasses(detectors)) {
-        // A partial scan must not turn later discoveries into new alerts.
-        if (!await scanPass(pass, tracker, skipped)) return;
+      await refreshWmeInfo();
+      for (const pass of plannedPasses(detectors.map((d) => d.key))) {
+        scanState.passLabel = pass.label;
+        const passDetectors = detectors.filter((d) => pass.keys.includes(d.key));
+        if (!await runPass(pass, passDetectors, api)) return;
       }
       if (!scanState.running) return;
-      tracker.disconnect();
-      tracker = null;
       scanState.passLabel = "";
-      restoreLayers();
+      await refreshWmeInfo(); // links are built from the editor's current permalink
 
       // Finalize: build and send this run's notifications.
       for (const det of detectors) {
-        if (skipped.has(det.key)) continue;
-        try { await det.finalize(); } catch (e) {
+        try { await det.finalize(api); } catch (e) {
+          if (e.stopped) return;
           console.error("[WME Auto Scan] finalize error", e);
           if (det.key === "edit") setEditStatus("User edits incomplete: " + e.message);
         }
@@ -2433,17 +2079,14 @@
         saveTiming(settings.region, { lastScanMs: Date.now() - scanState.startTime, lastScanAt: Date.now() });
       }
     } catch (e) {
-      console.error("[WME Auto Scan] scan failed", e);
-      setStatus("Scan failed: " + e.message);
+      if (!e.stopped) {
+        console.error("[WME Auto Scan] scan failed", e);
+        setStatus("Scan failed: " + e.message);
+      }
     } finally {
-      if (tracker) tracker.disconnect();
-      restoreLayers();
+      api.abort();
+      scanState.api = null;
       scanState.passLabel = "";
-      // Restore the editor's original view.
-      try {
-        sdk.Map.setMapCenter({ lonLat: originalCenter, zoomLevel: originalZoom });
-        sdk.Editing.clearSelection();
-      } catch (e) {}
       scanState.running = false;
       refreshUI();
     }
@@ -2474,6 +2117,7 @@
     scanState.running = false;
     scanState.nextScanAt = 0;
     clearTimeout(scanState.intervalTimer);
+    if (scanState.api) scanState.api.abort();
     setStatus("Stopped.");
     refreshUI();
   }
@@ -2491,9 +2135,9 @@
   // Region selection
   // ---------------------------------------------------------------------------
   // Single entry point for setting the scan region: thins the outline so culling
-  // stays fast, then stores it. Changing the region invalidates nothing else —
-  // the mask is keyed to the (simplified) coordinates, so a new region simply has
-  // no mask yet.
+  // stays fast, then stores it. Scan state (baselines, timing, edit
+  // checkpoints) is keyed to the simplified coordinates, so a new region simply
+  // starts fresh.
   function setRegion(label, coordinates) {
     const before = (coordinates && coordinates[0] && coordinates[0].length) || 0;
     const simplified = simplifyPolygonCoords(coordinates);
@@ -2520,10 +2164,10 @@
   // Columbia"). The named list lives on the user session (id + name, no
   // geometry); the geometry lives on the data-model areas (id + geometry, but
   // only the manager's username). Join them by id to label areas by place.
-  function managedAreaNames() {
+  async function managedAreaNames() {
     const byId = new Map();
     try {
-      const info = sdk.State.getUserInfo();
+      const info = await sdk.State.getUserInfo();
       for (const m of (info && info.managedAreas) || []) {
         if (m && m.id != null && m.name) byId.set(String(m.id), m.name);
       }
@@ -2531,11 +2175,11 @@
     return byId;
   }
 
-  function managedAreaPresets() {
+  async function managedAreaPresets() {
     const presets = [];
-    const names = managedAreaNames();
+    const names = await managedAreaNames();
     try {
-      const areas = sdk.DataModel.ManagedAreas.getAll();
+      const areas = await sdk.DataModel.ManagedAreas.getAll();
       areas.forEach((a) => {
         if (a.geometry && a.geometry.coordinates) {
           const name = names.get(String(a.id));
@@ -2544,7 +2188,7 @@
       });
     } catch (e) {}
     try {
-      const info = sdk.State.getUserInfo();
+      const info = await sdk.State.getUserInfo();
       if (info && info.editableAreas) {
         info.editableAreas.forEach((a, i) => {
           if (a.geometry && a.geometry.coordinates) {
@@ -2560,23 +2204,23 @@
   // Collect the editor usernames attached to whatever is loaded in the current
   // view — used to auto-fill the whitelist. Most data-model objects carry a
   // resolved createdBy/updatedBy, so we sweep the common ones.
-  function scrapeAreaUsernames() {
+  async function scrapeAreaUsernames() {
     const names = new Set();
     const add = (n) => { if (n) names.add(n); };
-    const sweep = (getter) => {
+    const sweep = async (getter) => {
       try {
-        for (const o of getter() || []) {
+        for (const o of (await getter()) || []) {
           const m = o && o.modificationData;
           if (m) { add(m.createdBy); add(m.updatedBy); }
         }
       } catch (e) {}
     };
-    sweep(() => sdk.DataModel.Segments.getAll());
-    sweep(() => sdk.DataModel.Venues.getAll());
-    sweep(() => sdk.DataModel.MapComments.getAll());
-    sweep(() => sdk.DataModel.RoadClosures.getAll());
+    await sweep(() => sdk.DataModel.Segments.getAll());
+    await sweep(() => sdk.DataModel.Venues.getAll());
+    await sweep(() => sdk.DataModel.MapComments.getAll());
+    await sweep(() => sdk.DataModel.RoadClosures.getAll());
     try {
-      for (const u of sdk.DataModel.MapUpdateRequests.getAll() || []) {
+      for (const u of (await sdk.DataModel.MapUpdateRequests.getAll()) || []) {
         add(u && u.userName);
         if (u && u.modificationData) { add(u.modificationData.createdBy); add(u.modificationData.updatedBy); }
       }
@@ -2753,18 +2397,12 @@
   }
 
   function statusText() {
-    if (optimizeState.running) {
-      const elapsed = Date.now() - (optimizeState.startTime || Date.now());
-      const remaining = estimateRemaining("optimize", elapsed, optimizeState.done, optimizeState.total);
-      const rem = remaining != null ? ` (${fmtDuration(remaining)} left)` : "";
-      const roads = optimizeState.total ? ` · ${optimizeState.productive} with roads` : "";
-      return `Optimizing… ${fmtDuration(elapsed)}${rem}${roads}`;
-    }
     if (scanState.running) {
       const elapsed = Date.now() - (scanState.startTime || Date.now());
-      const remaining = estimateRemaining("scan", elapsed, scanState.tilesDone, scanState.tilesTotal);
+      if (!scanState.passLabel) return `Sending notifications… ${fmtDuration(elapsed)}`;
+      const remaining = estimateRemaining(elapsed, scanState.tilesDone, scanState.tilesTotal);
       const rem = remaining != null ? ` (${fmtDuration(remaining)} left)` : "";
-      return `Scanning${scanState.passLabel ? " " + scanState.passLabel : ""}… ${fmtDuration(elapsed)}${rem}`;
+      return `Scanning ${scanState.passLabel} ${scanState.tilesDone}/${scanState.tilesTotal}… ${fmtDuration(elapsed)}${rem}`;
     }
     if (scanState.scheduled && scanState.nextScanAt) {
       return `Next scan in: ${fmtDuration(scanState.nextScanAt - Date.now())}`;
@@ -2812,7 +2450,7 @@
       text: scanState.scheduled ? "Running" : "Run",
       onclick: startScanning,
     });
-    if (scanState.scheduled || scanState.running || optimizeState.running) runBtn.disabled = true;
+    if (scanState.scheduled || scanState.running) runBtn.disabled = true;
 
     const stopBtn = el("button", { class: "was-btn danger", text: "Stop", onclick: stopScanning });
     if (!scanState.scheduled && !scanState.running) stopBtn.disabled = true;
@@ -2848,11 +2486,13 @@
         sec.appendChild(el("label", { class: "was-row" }, [el("span", { text: "Per-user cooldown (minutes; 0 = every scan)" }), cooldown]));
       }
 
-      // Issue-Tracker-gated detectors (Update Requests, Map Suggestions) only see
-      // whatever WME's filter/group state currently exposes, which the script can
-      // read but not change — warn so a limited scan isn't a silent surprise.
-      if (FILTER_GATED_DETECTORS.has(key) && d.enabled) {
-        sec.appendChild(el("div", { class: "was-muted", text: "⚠ Scan can only see your current filters, it's recommended to remove all filters.", style: "margin:2px 0 6px 24px; color:#e67e22" }));
+      // New-road (segment) suggestions can arrive in bulk imports, so they can be
+      // left out of Map Suggestions alerts.
+      if (key === "suggestion" && d.enabled) {
+        const segs = el("input", { type: "checkbox" });
+        segs.checked = d.includeSegments !== false;
+        segs.addEventListener("change", () => { d.includeSegments = segs.checked; saveSettings(); });
+        sec.appendChild(el("label", { class: "was-check", style: "margin-left:24px" }, [segs, el("span", { text: "Include new-road suggestions" })]));
       }
     }
     return sec;
@@ -2907,23 +2547,30 @@
     if (!regionDraft) saveBtn.disabled = true;
     sec.appendChild(el("div", { class: "was-btns" }, [saveBtn]));
 
-    sec.appendChild(buildOptimizeRow());
+    sec.appendChild(buildScanAreasRow());
     return sec;
   }
 
+  // Presets come from async SDK calls, so the list fills in after render; the
+  // last result is kept so the re-render after a pick shows it immediately.
+  let managedPresetsCache = null;
   function buildManagedAreaPicker() {
     const row = el("div", { class: "was-row" });
-    const presets = managedAreaPresets();
     const select = el("select");
-    select.appendChild(el("option", { value: "", text: "Choose a managed area…" }));
-    presets.forEach((p, i) => select.appendChild(el("option", { value: String(i), text: p.label })));
+    row.appendChild(select);
+    const fill = (presets) => {
+      select.innerHTML = "";
+      select.appendChild(el("option", { value: "", text: presets.length ? "Choose a managed area…" : "No managed areas found on your account." }));
+      presets.forEach((p, i) => select.appendChild(el("option", { value: String(i), text: p.label })));
+    };
     select.addEventListener("change", () => {
       if (select.value === "") { regionDraft = null; return; }
-      const p = presets[Number(select.value)];
+      const p = (managedPresetsCache || [])[Number(select.value)];
       if (p) { regionDraft = { label: p.label, coordinates: p.coordinates }; refreshUI(); }
     });
-    row.appendChild(select);
-    if (!presets.length) row.appendChild(el("div", { class: "was-muted", text: "No managed areas found on your account.", style: "margin-top:4px" }));
+    if (managedPresetsCache) fill(managedPresetsCache);
+    else select.appendChild(el("option", { value: "", text: "Loading managed areas…" }));
+    managedAreaPresets().then((presets) => { managedPresetsCache = presets; fill(presets); });
     return row;
   }
 
@@ -2956,57 +2603,26 @@
     return wrap;
   }
 
-  // Optimize control + plain-language status, shown inside the region section.
-  function buildOptimizeRow() {
+  // How many requests a scan of this region makes, per pass, plus the eye that
+  // draws them. Shown inside the region section.
+  function buildScanAreasRow() {
     const wrap = el("div", { style: "margin-top:10px; padding-top:8px; border-top:1px solid var(--was-border)" });
     const hasRegion = !!(settings.region && settings.region.coordinates);
-    const mask = hasRegion ? loadMask(settings.region) : null;
-    const optimized = !!(mask && mask.complete);
-
-    const btns = el("div", { class: "was-btns" });
-    if (optimizeState.running) {
-      btns.appendChild(el("button", { class: "was-btn danger", text: "Stop", onclick: stopOptimize }));
-      btns.appendChild(el("span", { class: "was-muted", text: `Optimizing… ${optimizeState.done}/${optimizeState.total} areas` }));
-    } else {
-      const resuming = mask && !mask.complete;
-      const btnLabel = optimized ? "Re-optimize" : (resuming ? "Resume optimizing" : "Optimize");
-      const optBtn = el("button", {
-        class: "was-btn " + (optimized ? "secondary" : "go"),
-        title: "Map which tiles contain roads so scans skip empty areas and finish faster",
-        text: btnLabel,
-        onclick: () => {
-          // Re-optimizing a region that's already done throws away a good mask,
-          // so confirm first when nothing about the region has changed.
-          if (optimized && !confirm("This area is already optimized. Run optimization again?")) return;
-          runOptimize();
-        },
-      });
-      if (!hasRegion || scanState.running) optBtn.disabled = true;
-      btns.appendChild(optBtn);
-
-      // Eye: draw every tile box the scan will visit.
-      const boxesEye = el("button", { class: "was-eye", title: "Show the scan areas on the map", text: "👁", onclick: toggleBoxesPreview });
-      if (!hasRegion || scanState.running) boxesEye.disabled = true;
-      btns.appendChild(boxesEye);
-
-      const pill = optimized
-        ? el("span", { class: "was-pill on", text: "Optimized" })
-        : el("span", { class: "was-pill off", text: "Not optimized" });
-      btns.appendChild(pill);
-
-      if (mask) {
-        const clearBtn = el("button", { class: "was-btn secondary", title: "Discard the saved optimization for this region", text: "Clear", onclick: () => { clearMask(settings.region); refreshUI(); } });
-        if (scanState.running) clearBtn.disabled = true;
-        btns.appendChild(clearBtn);
-      }
+    const btns = el("div", { class: "was-btns", style: "align-items:center" });
+    const eye = el("button", { class: "was-eye", title: "Show the scan's request boxes on the map", text: "👁", onclick: toggleBoxesPreview });
+    if (!hasRegion) eye.disabled = true;
+    btns.appendChild(eye);
+    let summary = "Choose a region to see its scan size.";
+    if (hasRegion) {
+      try {
+        const passes = plannedPasses();
+        summary = passes.length
+          ? "Requests per scan: " + passes.map((p) => `${p.tiles.length} ${p.label}`).join(" · ")
+          : "Turn on a detector to see its scan size.";
+      } catch (e) { summary = "Couldn't plan the scan: " + e.message; }
     }
+    btns.appendChild(el("span", { class: "was-muted", text: summary }));
     wrap.appendChild(btns);
-
-    if (optimized && maskIsStale(mask)) {
-      wrap.appendChild(el("div", { class: "was-muted", text: `Optimized over ${MASK_STALE_DAYS} days ago. Run it again if roads have changed.`, style: "margin-top:6px; color:#b45309" }));
-    } else if (mask && !mask.complete && !optimizeState.running) {
-      wrap.appendChild(el("div", { class: "was-muted", text: `Paused after ${mask.nextIndex || 0} of ${mask.total} areas.`, style: "margin-top:6px" }));
-    }
     return wrap;
   }
 
@@ -3134,8 +2750,8 @@
     // Auto-fill: pull the editors visible in the current map view.
     const found = el("div", { class: "was-search-results" });
     const scanBtn = el("button", { class: "was-btn secondary", title: "List editors currently visible in the map view to whitelist", text: "Find editors in view" });
-    scanBtn.addEventListener("click", () => {
-      const names = scrapeAreaUsernames().sort((a, b) => a.localeCompare(b));
+    scanBtn.addEventListener("click", async () => {
+      const names = (await scrapeAreaUsernames()).sort((a, b) => a.localeCompare(b));
       fillDatalist(names);
       found.innerHTML = "";
       const fresh = names.filter((n) => !settings.whitelist.some((w) => w.toLowerCase() === n.toLowerCase()));
@@ -3162,22 +2778,19 @@
     suggestion: { name: "Map Suggestions", phase1: true },
   };
 
-  // Detectors whose data WME only loads through the Issue Tracker, so a scan
-  // sees only what the editor's current filters expose.
-  const FILTER_GATED_DETECTORS = new Set(["report", "suggestion"]);
-
   // ---------------------------------------------------------------------------
   // Bootstrap
   // ---------------------------------------------------------------------------
   let settings = defaultSettings();
 
-  function bootstrap() {
-    sdk = PAGE.getWmeSdk({ scriptId: SCRIPT_ID, scriptName: SCRIPT_NAME });
+  async function bootstrap() {
+    sdk = PAGE.getWmeSdk({ scriptId: SCRIPT_ID, scriptName: SCRIPT_NAME, mode: "async" });
     settings = loadSettings();
+    await refreshWmeInfo();
 
-    // A tab closed mid-scan leaves the scan's layer choices behind; put the
-    // editor's own layers back.
-    restoreLayers();
+    // A tab closed mid-scan by an older version left the scan's layer choices
+    // behind; put the editor's own layers back.
+    await restoreLegacyLayers();
 
     // Migrate a region stored by an earlier version (raw, un-thinned OSM outline)
     // so its coastline no longer freezes tile culling. Re-simplify in place.
@@ -3194,14 +2807,14 @@
 
     // Cache localized road-type names.
     try {
-      for (const rt of sdk.DataModel.Segments.getRoadTypes()) roadTypeNames[rt.id] = rt.localizedName || rt.name;
+      for (const rt of await sdk.DataModel.Segments.getRoadTypes()) roadTypeNames[rt.id] = rt.localizedName || rt.name;
     } catch (e) {}
 
     // Identify the current user and, on first load, whitelist them by default
     // (removable — we only seed once, tracked by whitelistSeeded).
     let selfUserName = null;
     try {
-      const info = sdk.State.getUserInfo();
+      const info = await sdk.State.getUserInfo();
       if (info && info.userName) {
         selfUserName = info.userName;
         noteUsername(info.userName);

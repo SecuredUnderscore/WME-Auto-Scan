@@ -2,7 +2,7 @@
 
 Have you ever entered the map editor without a plan? Blindly panning around the map to find issues to solve. Sometimes realizing your 10 hours late to a road closure. No more! Get a notification when something actionable happens. Road Closure report, new Update Request, and more.
 
-WME Auto Scan uses the official WME SDK (For now...).
+WME Auto Scan reads map data straight from WME's own map service, using your logged-in session. It only ever reads (nothing is written to the map), and it never moves your map, so you can keep editing while it scans.
 
 **[Install on Greasy Fork](https://greasyfork.org/en/scripts/595728-wme-auto-scan)** · **[Source & issues on GitHub](https://github.com/SecuredUnderscore/WME-Auto-Scan)**
 
@@ -16,7 +16,7 @@ WME Auto Scan uses the official WME SDK (For now...).
   - **Update Requests (URs)**
   - **Map Suggestions**
 - **Flexible Region Selection** — Choose an area from your **managed areas**, **search for a place** (city, county, country via OpenStreetMap), or **draw a polygon** directly on the map.
-- **Tile Mask Optimization** — Perform a one-time scan to map road-bearing tiles. Subsequent scans skip water and empty land speeding up cycles.
+- **Fast, hands-off scanning** — Several areas are requested at once, sized to what the map service returns completely. Your map, layers and selection are left alone.
 - **Editor Whitelist** — Ignore events from specific editors.
 
 ---
@@ -45,12 +45,7 @@ Open the **Auto Scan** tab in the sidebar to access **Settings** and **Run** mod
    - **Search for a place** — Search a location and select a result.
    - **Draw on map** — Click **Draw area on map** and outline a polygon.
 2. Click **Save**. Click 👁 to view the region outline on the map.
-
-#### Optimization (Recommended)
-- Click **Optimize** to map and save active road tiles.
-- Optimization is resumable if interrupted and prompts for a refresh after 30 days.
-- Optimizations made before v0.2.0 are discarded—run **Optimize** once after updating.
-- Click 👁 next to Optimize to preview scanned tiles.
+3. Below the region, **Requests per scan** shows how many requests each scan makes. Click its 👁 to draw them on the map.
 
 #### General Settings
 - **Scan interval** — Set the delay between scans in minutes (also displays the duration of the last scan).
@@ -61,13 +56,11 @@ Open the **Auto Scan** tab in the sidebar to access **Settings** and **Run** mod
 
 ### 2. Scanning (Run Tab)
 
-1. Enable your desired detectors (**Road closures**, **User edits**, **Update Requests**, **Map Suggestions**) and set cooldowns if needed.
+1. Enable your desired detectors (**Road closures**, **User edits**, **Update Requests**, **Map Suggestions**) and set cooldowns if needed. Map Suggestions includes new-road suggestions unless you untick **Include new-road suggestions**.
 2. Click **Run** to start scanning. The status bar shows live progress and a countdown to the next cycle.
 3. Click **Stop** at any time to halt the loop.
 
-While scanning, the script shows only the map layers your detectors need and restores your layers when it's done.
-
-> ⚠️ **Update Requests & Map Suggestions:** These are read through WME's Issue Tracker, so a scan only sees what your **current map filters** allow. For complete results, clear all filters before scanning. If a group is turned off in the filters, that detector is skipped for the scan.
+The first scan of a region records what already exists and sends nothing; later scans notify you about anything new. Update Requests and Map Suggestions cover everything open in the region, whatever your Issue Tracker filters are set to.
 
 ## License
 
