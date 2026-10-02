@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME Auto Scan
 // @namespace    https://github.com/SecuredUnderscore/WME-Auto-Scan
-// @version      0.4.0
+// @version      0.4.1
 // @description  Scans a selected area in Waze Map Editor for road closures, user edits, update requests, and map suggestions, and sends notifications to Discord or Pushover.
 // @author       SecuredUnderscore
 // @match        https://www.waze.com/editor*
@@ -35,7 +35,7 @@
   // ---------------------------------------------------------------------------
   const SCRIPT_ID = "wme-auto-scan";
   const SCRIPT_NAME = "WME Auto Scan";
-  const SCRIPT_VERSION = "0.4.0"; // keep in sync with @version above
+  const SCRIPT_VERSION = "0.4.1"; // keep in sync with @version above
   const STORAGE_KEY = "wme-auto-scan:settings:v1";
 
   // --- Map API scanning ----------------------------------------------------
@@ -694,7 +694,7 @@
     for (let i = 0; i < total; i++) {
       const box = gridCellBox(grid, i);
       const inside = index.pointIn([(box[0] + box[2]) / 2, (box[1] + box[3]) / 2]);
-      if (inside || edge[i]) tiles.push({ box, inside: inside && !edge[i] });
+      if (inside || edge[i]) tiles.push({ box, inside: inside && !edge[i], index: i });
     }
     tileCache.set(cacheKey, tiles);
     return tiles;
@@ -1922,8 +1922,9 @@
     }
     if (on.includes("edit")) {
       const places = settings.global.skipPlaces ? {} : { venueLevel: 4, venueFilter: "1,1,1,1" };
+      const mask = loadMask(settings.region);
       passes.push({
-        label: "edits", keys: ["edit"], tiles: regionTiles(polygon, ROAD_TILE_DEG),
+        label: "edits", keys: ["edit"], tiles: editTiles(polygon, mask), optimized: !!(mask && mask.complete),
         fetch: (api, tile) => api.features(tile.box, { roadTypes: ALL_ROAD_TYPES, ...places }),
       });
     }
@@ -1936,12 +1937,12 @@
   // the pass's detectors. A tile the pass refuses (or splits) is replaced by its
   // quarters. Any request that can't be completed fails the whole scan, so a
   // partial scan never turns later discoveries into new alerts.
-  async function runPass(pass, detectors, api) {
+  async function runPass(pass, detectors, api, state = scanState) {
     const queue = pass.tiles.map((t) => ({ ...t }));
-    scanState.tilesTotal += queue.length;
+    state.tilesTotal += queue.length;
     let failure = null, inFlight = 0;
     const worker = async () => {
-      while (!failure && scanState.running) {
+      while (!failure && state.running) {
         if (!queue.length) {
           if (!inFlight) return;
           await sleep(50);
@@ -1963,9 +1964,9 @@
           await yieldToPage();
           if (children && children.length) {
             queue.unshift(...children);
-            scanState.tilesTotal += children.length;
+            state.tilesTotal += children.length;
           }
-          scanState.tilesDone++;
+          state.tilesDone++;
         } catch (e) {
           failure = failure || e;
         } finally {
@@ -1975,7 +1976,132 @@
     };
     await Promise.all(Array.from({ length: MAX_PARALLEL }, worker));
     if (failure) throw failure;
-    return scanState.running;
+    return state.running;
+  }
+
+  // --- User edits optimization -----------------------------------------------
+  // User edits are scanned in small boxes (ROAD_TILE_DEG), so a large region
+  // means thousands of requests — most of them over water or wilderness. An
+  // optimize run requests every box once and records which hold any segment or
+  // place; later User edits scans request only those. A road or place created
+  // in a skipped box is missed until the next optimize, so a mask older than
+  // MASK_STALE_DAYS asks to be refreshed. The other detectors always scan the
+  // whole region: closures and Issue Tracker items use large boxes already, and
+  // a "missing road" report sits exactly where no road is.
+  const MASK_STORAGE_PREFIX = "wme-auto-scan:mask:v3:"; // v1/v2 belonged to the map-panning engine
+  const MASK_STALE_DAYS = 30;
+  const OPTIMIZE_SAVE_EVERY = 50; // persist optimize progress every N boxes (resumable)
+  const OPTIMIZE_HELP = "Optimization only applies to User edits. It checks every User edits box in the region once and remembers which contain roads or places, so User edits scans skip the empty ones (water, wilderness). Road closures, Update Requests and Map Suggestions always scan the whole region. New roads or places built in a skipped area aren't seen until you optimize again.";
+  const optimizeState = { running: false, api: null, tilesDone: 0, tilesTotal: 0, startTime: 0, productive: 0 };
+
+  // A mask is only usable for the region and box size it was built for.
+  function loadMask(region) {
+    if (!region || !region.coordinates) return null;
+    try {
+      const raw = GM_getValue(MASK_STORAGE_PREFIX + regionKey(region), null);
+      if (!raw) return null;
+      const mask = typeof raw === "string" ? JSON.parse(raw) : raw;
+      if (!mask || mask.version !== 3 || mask.step !== ROAD_TILE_DEG || !Array.isArray(mask.productive)) return null;
+      if (mask.total !== regionTiles(region.coordinates, ROAD_TILE_DEG).length) return null;
+      return mask;
+    } catch (e) { return null; }
+  }
+
+  function saveMask(region, mask) {
+    try { GM_setValue(MASK_STORAGE_PREFIX + regionKey(region), JSON.stringify(mask)); }
+    catch (e) { console.error("[WME Auto Scan] failed to save optimization", e); }
+  }
+
+  function clearMask(region) {
+    try { GM_setValue(MASK_STORAGE_PREFIX + regionKey(region), null); } catch (e) {}
+  }
+
+  function maskIsStale(mask) {
+    return !!(mask && mask.builtAt && Date.now() - Date.parse(mask.builtAt) > MASK_STALE_DAYS * 86400000);
+  }
+
+  // The User edits boxes a scan requests: all of them, or just the productive
+  // ones once the region is optimized.
+  function editTiles(polygon, mask) {
+    const tiles = regionTiles(polygon, ROAD_TILE_DEG);
+    if (!mask || !mask.complete) return tiles;
+    const keep = new Set(mask.productive);
+    return tiles.filter((t) => keep.has(t.index));
+  }
+
+  async function runOptimize() {
+    if (optimizeState.running || scanState.running || scanState.scheduled) return;
+    const region = settings.region;
+    if (!region || !region.coordinates) { setStatus("Choose a scan area before optimizing."); return; }
+    const tiles = regionTiles(region.coordinates, ROAD_TILE_DEG);
+
+    // Resume an unfinished run on this region; anything else starts over.
+    let mask = loadMask(region);
+    if (!mask || mask.complete) {
+      mask = { version: 3, step: ROAD_TILE_DEG, total: tiles.length, productive: [], nextIndex: 0, complete: false, builtAt: null };
+    }
+    const found = new Set(mask.productive);
+    const start = Math.min(mask.nextIndex || 0, tiles.length);
+    const todo = tiles.slice(start).map((t, pos) => ({ ...t, pos }));
+    const done = new Uint8Array(todo.length);
+    let low = 0, sinceSave = 0;
+    const persist = () => {
+      mask.nextIndex = start + low;
+      mask.productive = [...found];
+      saveMask(region, mask);
+    };
+
+    Object.assign(optimizeState, { running: true, tilesDone: start, tilesTotal: start, resumedAt: start, startTime: Date.now(), productive: found.size });
+    const api = createApiClient(() => !optimizeState.running);
+    optimizeState.api = api;
+    refreshUI();
+    try {
+      await refreshWmeInfo();
+      // Places are always included so the mask stays right if "Don't scan places" changes.
+      const pass = {
+        label: "optimize", tiles: todo,
+        fetch: (a, tile) => a.features(tile.box, { roadTypes: ALL_ROAD_TYPES, venueLevel: 4, venueFilter: "1,1,1,1" }),
+      };
+      const recorder = {
+        collect(reply, tile) {
+          const segments = (reply.segments && reply.segments.objects) || [];
+          const venues = (reply.venues && reply.venues.objects) || [];
+          if (segments.length || venues.length) found.add(tile.index);
+          optimizeState.productive = found.size;
+          done[tile.pos] = 1;
+          while (low < done.length && done[low]) low++;
+          if (++sinceSave >= OPTIMIZE_SAVE_EVERY) { sinceSave = 0; persist(); }
+        },
+      };
+      const finished = await runPass(pass, [recorder], api, optimizeState);
+      persist();
+      if (finished && low === done.length) {
+        mask.complete = true;
+        mask.builtAt = new Date().toISOString();
+        saveMask(region, mask);
+        setStatus(`Optimization complete: ${found.size} of ${tiles.length} User edits areas have roads or places. User edits scans will skip the other ${tiles.length - found.size}.`);
+      } else {
+        setStatus(`Optimization paused at ${start + low}/${tiles.length}. You can resume it later.`);
+      }
+    } catch (e) {
+      persist();
+      if (!e.stopped) {
+        console.error("[WME Auto Scan] optimize failed", e);
+        setStatus("Optimization failed: " + e.message + " Progress was saved; you can resume it.");
+      } else {
+        setStatus(`Optimization paused at ${start + low}/${tiles.length}. You can resume it later.`);
+      }
+    } finally {
+      api.abort();
+      optimizeState.api = null;
+      optimizeState.running = false;
+      refreshUI();
+    }
+  }
+
+  function stopOptimize() {
+    optimizeState.running = false;
+    if (optimizeState.api) optimizeState.api.abort();
   }
 
   function regionKey(region) {
@@ -2027,6 +2153,7 @@
 
   async function runScan() {
     if (scanState.running) return;
+    if (optimizeState.running) { setStatus("Optimization is running; this scan was skipped."); return; }
     if (!settings.region || !settings.region.coordinates) {
       setStatus("Choose a scan area first.");
       return;
@@ -2123,6 +2250,7 @@
   }
 
   function startBlockReason() {
+    if (optimizeState.running) return "Wait for optimization to finish (or stop it) before scanning.";
     if (!settings.region || !settings.region.coordinates) return "Choose a scan area first.";
     const enabled = Object.keys(settings.detectors).filter((k) => settings.detectors[k].enabled);
     if (!enabled.length) return "Turn on at least one detector.";
@@ -2397,6 +2525,13 @@
   }
 
   function statusText() {
+    if (optimizeState.running) {
+      const elapsed = Date.now() - (optimizeState.startTime || Date.now());
+      const done = optimizeState.tilesDone, total = optimizeState.tilesTotal;
+      const fresh = done - (optimizeState.resumedAt || 0);
+      const rem = fresh > 0 && total > done ? ` (${fmtDuration((elapsed / fresh) * (total - done))} left)` : "";
+      return `Optimizing User edits ${done}/${total}… ${fmtDuration(elapsed)}${rem} · ${optimizeState.productive} with roads or places`;
+    }
     if (scanState.running) {
       const elapsed = Date.now() - (scanState.startTime || Date.now());
       if (!scanState.passLabel) return `Sending notifications… ${fmtDuration(elapsed)}`;
@@ -2450,7 +2585,7 @@
       text: scanState.scheduled ? "Running" : "Run",
       onclick: startScanning,
     });
-    if (scanState.scheduled || scanState.running) runBtn.disabled = true;
+    if (scanState.scheduled || scanState.running || optimizeState.running) runBtn.disabled = true;
 
     const stopBtn = el("button", { class: "was-btn danger", text: "Stop", onclick: stopScanning });
     if (!scanState.scheduled && !scanState.running) stopBtn.disabled = true;
@@ -2510,6 +2645,7 @@
       head.appendChild(el("button", { class: "was-eye", title: "Show this region on the map", text: "👁", onclick: toggleRegionPreview }));
     }
     sec.appendChild(head);
+    if (settings.region && settings.region.coordinates) sec.appendChild(buildOptimizeRow());
 
     // --- Choose New Region: one dropdown holding the three pick methods. -----
     const chooser = el("select");
@@ -2603,6 +2739,55 @@
     return wrap;
   }
 
+  // Optimization status + control for User edits, shown under the current region.
+  function buildOptimizeRow() {
+    const wrap = el("div", { style: "margin:-2px 0 10px", title: OPTIMIZE_HELP });
+    const mask = loadMask(settings.region);
+    const optimized = !!(mask && mask.complete);
+    const total = regionTiles(settings.region.coordinates, ROAD_TILE_DEG).length;
+    const btns = el("div", { class: "was-btns", style: "align-items:center" });
+
+    if (optimizeState.running) {
+      btns.appendChild(el("button", { class: "was-btn danger", text: "Stop", title: "Pause optimization. Progress is saved and can be resumed.", onclick: stopOptimize }));
+      btns.appendChild(el("span", { class: "was-muted", text: `Optimizing… ${optimizeState.tilesDone}/${optimizeState.tilesTotal}` }));
+    } else {
+      const resuming = mask && !mask.complete;
+      const label = optimized ? "Re-optimize" : resuming ? "Resume optimizing" : "Optimize";
+      const optBtn = el("button", {
+        class: "was-btn " + (optimized ? "secondary" : "go"),
+        text: label,
+        title: OPTIMIZE_HELP,
+        onclick: () => {
+          if (optimized && !confirm("This region is already optimized for User edits. Optimize it again?")) return;
+          runOptimize();
+        },
+      });
+      const busy = scanState.running || scanState.scheduled;
+      if (busy) {
+        optBtn.disabled = true;
+        optBtn.title = "Stop scanning to optimize. " + OPTIMIZE_HELP;
+      }
+      btns.appendChild(optBtn);
+
+      const pill = optimized
+        ? el("span", { class: "was-pill on", text: "Optimized", title: `User edits scans request ${mask.productive.length} of ${total} areas (the rest had no roads or places). Built ${new Date(mask.builtAt).toLocaleDateString()}. Only applies to User edits.` })
+        : el("span", { class: "was-pill off", text: resuming ? `Paused ${mask.nextIndex}/${total}` : "Not optimized", title: OPTIMIZE_HELP });
+      btns.appendChild(pill);
+
+      if (mask) {
+        const clearBtn = el("button", { class: "was-btn secondary", text: "Clear", title: "Discard this region's User edits optimization; User edits scans go back to every area.", onclick: () => { clearMask(settings.region); refreshUI(); } });
+        if (busy) clearBtn.disabled = true;
+        btns.appendChild(clearBtn);
+      }
+    }
+    wrap.appendChild(btns);
+    wrap.appendChild(el("div", { class: "was-muted", text: "Applies to User edits only.", style: "margin-top:4px" }));
+    if (optimized && maskIsStale(mask)) {
+      wrap.appendChild(el("div", { class: "was-muted", text: `Optimized over ${MASK_STALE_DAYS} days ago. Optimize again so new roads and places are covered.`, style: "margin-top:4px; color:#b45309" }));
+    }
+    return wrap;
+  }
+
   // How many requests a scan of this region makes, per pass, plus the eye that
   // draws them. Shown inside the region section.
   function buildScanAreasRow() {
@@ -2617,7 +2802,7 @@
       try {
         const passes = plannedPasses();
         summary = passes.length
-          ? "Requests per scan: " + passes.map((p) => `${p.tiles.length} ${p.label}`).join(" · ")
+          ? "Requests per scan: " + passes.map((p) => `${p.tiles.length} ${p.label}${p.optimized ? " (optimized)" : ""}`).join(" · ")
           : "Turn on a detector to see its scan size.";
       } catch (e) { summary = "Couldn't plan the scan: " + e.message; }
     }
