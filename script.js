@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME Auto Scan
 // @namespace    https://github.com/SecuredUnderscore/WME-Auto-Scan
-// @version      0.4.1
+// @version      0.4.2
 // @description  Scans a selected area in Waze Map Editor for road closures, user edits, update requests, and map suggestions, and sends notifications to Discord or Pushover.
 // @author       SecuredUnderscore
 // @match        https://www.waze.com/editor*
@@ -35,7 +35,7 @@
   // ---------------------------------------------------------------------------
   const SCRIPT_ID = "wme-auto-scan";
   const SCRIPT_NAME = "WME Auto Scan";
-  const SCRIPT_VERSION = "0.4.1"; // keep in sync with @version above
+  const SCRIPT_VERSION = "0.4.2"; // keep in sync with @version above
   const STORAGE_KEY = "wme-auto-scan:settings:v1";
 
   // --- Map API scanning ----------------------------------------------------
@@ -1982,16 +1982,17 @@
   // --- User edits optimization -----------------------------------------------
   // User edits are scanned in small boxes (ROAD_TILE_DEG), so a large region
   // means thousands of requests — most of them over water or wilderness. An
-  // optimize run requests every box once and records which hold any segment or
-  // place; later User edits scans request only those. A road or place created
-  // in a skipped box is missed until the next optimize, so a mask older than
+  // optimize run requests every box once and records which hold any segment
+  // (places are ignored); later User edits scans request only those. A road
+  // created in a skipped box — or an edit to a place with no road nearby — is
+  // missed until the next optimize, so a mask older than
   // MASK_STALE_DAYS asks to be refreshed. The other detectors always scan the
   // whole region: closures and Issue Tracker items use large boxes already, and
   // a "missing road" report sits exactly where no road is.
   const MASK_STORAGE_PREFIX = "wme-auto-scan:mask:v3:"; // v1/v2 belonged to the map-panning engine
   const MASK_STALE_DAYS = 30;
   const OPTIMIZE_SAVE_EVERY = 50; // persist optimize progress every N boxes (resumable)
-  const OPTIMIZE_HELP = "Optimization only applies to User edits. It checks every User edits box in the region once and remembers which contain roads or places, so User edits scans skip the empty ones (water, wilderness). Road closures, Update Requests and Map Suggestions always scan the whole region. New roads or places built in a skipped area aren't seen until you optimize again.";
+  const OPTIMIZE_HELP = "Optimization only applies to User edits. It checks every User edits box in the region once and remembers which contain road segments, so User edits scans skip the ones without roads (water, wilderness). Places don't count: a place in an area with no roads won't be scanned. Road closures, Update Requests and Map Suggestions always scan the whole region. New roads built in a skipped area aren't seen until you optimize again.";
   const optimizeState = { running: false, api: null, tilesDone: 0, tilesTotal: 0, startTime: 0, productive: 0 };
 
   // A mask is only usable for the region and box size it was built for.
@@ -2057,16 +2058,14 @@
     refreshUI();
     try {
       await refreshWmeInfo();
-      // Places are always included so the mask stays right if "Don't scan places" changes.
+      // Segments only: an area counts when it has any road segment.
       const pass = {
         label: "optimize", tiles: todo,
-        fetch: (a, tile) => a.features(tile.box, { roadTypes: ALL_ROAD_TYPES, venueLevel: 4, venueFilter: "1,1,1,1" }),
+        fetch: (a, tile) => a.features(tile.box, { roadTypes: ALL_ROAD_TYPES }),
       };
       const recorder = {
         collect(reply, tile) {
-          const segments = (reply.segments && reply.segments.objects) || [];
-          const venues = (reply.venues && reply.venues.objects) || [];
-          if (segments.length || venues.length) found.add(tile.index);
+          if (((reply.segments && reply.segments.objects) || []).length) found.add(tile.index);
           optimizeState.productive = found.size;
           done[tile.pos] = 1;
           while (low < done.length && done[low]) low++;
@@ -2079,7 +2078,7 @@
         mask.complete = true;
         mask.builtAt = new Date().toISOString();
         saveMask(region, mask);
-        setStatus(`Optimization complete: ${found.size} of ${tiles.length} User edits areas have roads or places. User edits scans will skip the other ${tiles.length - found.size}.`);
+        setStatus(`Optimization complete: ${found.size} of ${tiles.length} User edits areas have roads. User edits scans will skip the other ${tiles.length - found.size}.`);
       } else {
         setStatus(`Optimization paused at ${start + low}/${tiles.length}. You can resume it later.`);
       }
@@ -2530,7 +2529,7 @@
       const done = optimizeState.tilesDone, total = optimizeState.tilesTotal;
       const fresh = done - (optimizeState.resumedAt || 0);
       const rem = fresh > 0 && total > done ? ` (${fmtDuration((elapsed / fresh) * (total - done))} left)` : "";
-      return `Optimizing User edits ${done}/${total}… ${fmtDuration(elapsed)}${rem} · ${optimizeState.productive} with roads or places`;
+      return `Optimizing User edits ${done}/${total}… ${fmtDuration(elapsed)}${rem} · ${optimizeState.productive} with roads`;
     }
     if (scanState.running) {
       const elapsed = Date.now() - (scanState.startTime || Date.now());
@@ -2770,7 +2769,7 @@
       btns.appendChild(optBtn);
 
       const pill = optimized
-        ? el("span", { class: "was-pill on", text: "Optimized", title: `User edits scans request ${mask.productive.length} of ${total} areas (the rest had no roads or places). Built ${new Date(mask.builtAt).toLocaleDateString()}. Only applies to User edits.` })
+        ? el("span", { class: "was-pill on", text: "Optimized", title: `User edits scans request ${mask.productive.length} of ${total} areas (the rest had no road segments). Built ${new Date(mask.builtAt).toLocaleDateString()}. Only applies to User edits.` })
         : el("span", { class: "was-pill off", text: resuming ? `Paused ${mask.nextIndex}/${total}` : "Not optimized", title: OPTIMIZE_HELP });
       btns.appendChild(pill);
 
@@ -2783,7 +2782,7 @@
     wrap.appendChild(btns);
     wrap.appendChild(el("div", { class: "was-muted", text: "Applies to User edits only.", style: "margin-top:4px" }));
     if (optimized && maskIsStale(mask)) {
-      wrap.appendChild(el("div", { class: "was-muted", text: `Optimized over ${MASK_STALE_DAYS} days ago. Optimize again so new roads and places are covered.`, style: "margin-top:4px; color:#b45309" }));
+      wrap.appendChild(el("div", { class: "was-muted", text: `Optimized over ${MASK_STALE_DAYS} days ago. Optimize again so new roads are covered.`, style: "margin-top:4px; color:#b45309" }));
     }
     return wrap;
   }
