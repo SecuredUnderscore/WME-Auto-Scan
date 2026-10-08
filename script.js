@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME Auto Scan
 // @namespace    https://github.com/SecuredUnderscore/WME-Auto-Scan
-// @version      0.4.3
+// @version      0.4.4
 // @description  Scans a selected area in Waze Map Editor for road closures, user edits, update requests, place update requests, and map suggestions, and sends notifications to Discord or Pushover.
 // @author       SecuredUnderscore
 // @match        https://www.waze.com/editor*
@@ -37,7 +37,7 @@
   // ---------------------------------------------------------------------------
   const SCRIPT_ID = "wme-auto-scan";
   const SCRIPT_NAME = "WME Auto Scan";
-  const SCRIPT_VERSION = "0.4.3"; // keep in sync with @version above
+  const SCRIPT_VERSION = "0.4.4"; // keep in sync with @version above
   const STORAGE_KEY = "wme-auto-scan:settings:v1";
 
   // --- Map API scanning ----------------------------------------------------
@@ -100,6 +100,7 @@
     return {
       version: 1,
       global: {
+        showStatusBar: true, // floating bar over the map while Running
         scanIntervalMin: 10,
         discordWebhook: "",
         pushoverToken: "",
@@ -2019,9 +2020,15 @@
     api: null, // the running scan's API client (aborted on Stop)
     tilesDone: 0,
     tilesTotal: 0,
+    tilesPending: 0, // tiles of passes not started yet (whole-scan progress)
     startTime: 0, // ms timestamp the current scan began
     nextScanAt: 0, // ms timestamp the next scheduled scan will start
+    cooldownMs: 0, // length of the current wait between scans
     passLabel: "", // which scan pass is running
+    phase: "", // "scanning" | "sending" while a scan runs
+    passName: "", // readable name of the running pass, for the map status bar
+    passDoneAt: 0, // tilesDone / tilesTotal when the running pass started
+    passTotalAt: 0,
   };
 
   function activeDetectors() {
@@ -2294,21 +2301,25 @@
       return;
     }
     scanState.running = true;
+    scanState.phase = "scanning";
     scanState.polygon = settings.region.coordinates;
     scanState.region = indexPolygon(scanState.polygon);
     scanState.startTime = Date.now();
     scanState.tilesDone = 0;
     scanState.tilesTotal = 0;
+    scanState.tilesPending = 0;
 
     let detectors;
     try { detectors = activeDetectors(); }
     catch (e) {
       scanState.running = false;
+      scanState.phase = "";
       setStatus("Could not start scan: " + e.message);
       return;
     }
     if (!detectors.length) {
       scanState.running = false;
+      scanState.phase = "";
       setStatus("Turn on at least one detector.");
       return;
     }
@@ -2317,13 +2328,22 @@
     scanState.api = api;
     try {
       await refreshWmeInfo();
-      for (const pass of plannedPasses(detectors.map((d) => d.key))) {
+      // Count every pass's tiles up front so progress covers the whole scan.
+      const passes = plannedPasses(detectors.map((d) => d.key));
+      scanState.tilesPending = passes.reduce((n, p) => n + p.tiles.length, 0);
+      for (const pass of passes) {
         scanState.passLabel = pass.label;
+        scanState.passName = passDisplayName(pass);
+        scanState.passDoneAt = scanState.tilesDone;
+        scanState.passTotalAt = scanState.tilesTotal;
+        scanState.tilesPending -= pass.tiles.length;
         const passDetectors = detectors.filter((d) => pass.keys.includes(d.key));
         if (!await runPass(pass, passDetectors, api)) return;
       }
       if (!scanState.running) return;
       scanState.passLabel = "";
+      scanState.phase = "sending";
+      renderStatus();
       await refreshWmeInfo(); // links are built from the editor's current permalink
 
       // Finalize: build and send this run's notifications.
@@ -2349,6 +2369,7 @@
       api.abort();
       scanState.api = null;
       scanState.passLabel = "";
+      scanState.phase = "";
       scanState.running = false;
       refreshUI();
     }
@@ -2369,6 +2390,7 @@
     await runScan();
     if (!scanState.scheduled) return;
     const ms = Math.max(1, settings.global.scanIntervalMin) * 60 * 1000;
+    scanState.cooldownMs = ms;
     scanState.nextScanAt = Date.now() + ms;
     scanState.intervalTimer = setTimeout(loopScan, ms);
     renderStatus(); // the ticker now counts down to nextScanAt
@@ -2603,6 +2625,23 @@
     .was-search-results { max-height: 140px; overflow: auto; margin-top: 6px; }
     .was-search-results div { padding: 5px 7px; border-radius: 4px; cursor: pointer; }
     .was-search-results div:hover { background: var(--was-hover); }
+
+    /* Floating status bar over the map while Running. */
+    .was-bar { position: absolute; top: 31px; left: 50%; transform: translateX(-50%); width: 50%; z-index: 2000;
+      display: flex; align-items: center; gap: 12px; box-sizing: border-box; padding: 6px 8px 6px 14px;
+      background: #14532d; border: 1px solid #0b3a1e; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,.35);
+      color: #f0fdf4; font-size: 12px; line-height: 1.35; cursor: default; }
+    .was-bar-main { flex: 1; min-width: 0; }
+    .was-bar-title { font-weight: 700; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .was-bar-title span { font-weight: 600; color: #bbf7d0; }
+    .was-bar-line { display: flex; align-items: center; gap: 10px; margin-top: 2px; }
+    .was-bar-time { font-variant-numeric: tabular-nums; min-width: 64px; color: #dcfce7; white-space: nowrap; }
+    .was-bar-track { position: relative; flex: 1; height: 8px; border-radius: 4px; overflow: hidden;
+      background: rgba(255,255,255,.15); border: 1px solid rgba(255,255,255,.25); }
+    .was-bar-fill { position: absolute; top: 0; bottom: 0; background: #4ade80; transition: width 1s linear; }
+    .was-bar-stop { flex: none; align-self: center; cursor: pointer; border: 1px solid #991b1b; background: #dc2626;
+      color: #fff; border-radius: 6px; padding: 7px 14px; font-weight: 700; font-size: 12px; }
+    .was-bar-stop:hover { background: #b91c1c; }
   `;
 
   function el(tag, props = {}, children = []) {
@@ -2642,7 +2681,81 @@
     renderStatus();
   }
 
+  // --- Map status bar --------------------------------------------------------
+  // Shown over the map from Run until Stop (unless turned off in settings):
+  // the current phase, a timer, and a progress bar that fills while scanning
+  // and drains (left to right) through the wait before the next scan.
+  let mapViewportEl = null; // set in bootstrap
+  let statusBar = null; // { root, phase, time, fill }
+
+  // Short names for the status bar; the Issue Tracker pass lists its detectors.
+  const PASS_DETECTOR_NAMES = {
+    closure: "Road Closures", edit: "User Edits", report: "URs", placeRequest: "PURs", suggestion: "Map Suggestions",
+  };
+  function passDisplayName(pass) {
+    return pass.keys.map((k) => PASS_DETECTOR_NAMES[k] || k).join(", ");
+  }
+
+  function statusBarState() {
+    const now = Date.now();
+    if (scanState.running) {
+      const elapsed = fmtDuration(now - (scanState.startTime || now));
+      if (scanState.phase === "sending") return { phase: "Sending notifications", time: elapsed, pct: 100, fromRight: false };
+      const total = scanState.tilesTotal + scanState.tilesPending;
+      const pct = total > 0 ? Math.min(100, (scanState.tilesDone / total) * 100) : 0;
+      // This pass's requests, e.g. "Scanning User Edits (4/8)".
+      const passTotal = scanState.tilesTotal - scanState.passTotalAt;
+      const phase = scanState.passName && passTotal > 0
+        ? `Scanning ${scanState.passName} (${scanState.tilesDone - scanState.passDoneAt}/${passTotal})`
+        : "Scanning";
+      return { phase, time: elapsed, pct, fromRight: false };
+    }
+    const left = Math.max(0, scanState.nextScanAt - now);
+    const pct = scanState.nextScanAt && scanState.cooldownMs ? Math.min(100, (left / scanState.cooldownMs) * 100) : 0;
+    return { phase: "Cooldown", time: fmtDuration(left), pct, fromRight: true };
+  }
+
+  function buildStatusBar() {
+    const phase = el("span");
+    const time = el("div", { class: "was-bar-time" });
+    const fill = el("div", { class: "was-bar-fill" });
+    const root = el("div", { class: "was-bar" }, [
+      el("div", { class: "was-bar-main" }, [
+        el("div", { class: "was-bar-title" }, [document.createTextNode("Auto Scan Running · "), phase]),
+        el("div", { class: "was-bar-line" }, [time, el("div", { class: "was-bar-track" }, [fill])]),
+      ]),
+      el("button", { class: "was-bar-stop", text: "Stop", title: "Stop scanning", onclick: stopScanning }),
+    ]);
+    // Keep clicks and drags on the bar from reaching the map underneath.
+    for (const type of ["pointerdown", "mousedown", "click", "dblclick", "wheel"]) {
+      root.addEventListener(type, (e) => e.stopPropagation());
+    }
+    return { root, phase, time, fill };
+  }
+
+  function renderStatusBar() {
+    const show = scanState.scheduled && settings.global.showStatusBar !== false && mapViewportEl;
+    if (!show) {
+      if (statusBar) { statusBar.root.remove(); statusBar = null; }
+      return;
+    }
+    if (!statusBar) {
+      statusBar = buildStatusBar();
+      // The bar is placed relative to the map viewport.
+      if (getComputedStyle(mapViewportEl).position === "static") mapViewportEl.style.position = "relative";
+      mapViewportEl.appendChild(statusBar.root);
+    }
+    const s = statusBarState();
+    statusBar.phase.textContent = s.phase;
+    statusBar.time.textContent = s.time;
+    // Scanning fills from the left; the cooldown empties from the left.
+    statusBar.fill.style.left = s.fromRight ? "auto" : "0";
+    statusBar.fill.style.right = s.fromRight ? "0" : "auto";
+    statusBar.fill.style.width = s.pct.toFixed(2) + "%";
+  }
+
   function renderStatus() {
+    renderStatusBar();
     const s = tabPane && tabPane.querySelector(".was-status");
     if (!s) return;
     if (statusOverride && Date.now() < statusOverrideUntil) {
@@ -2669,7 +2782,8 @@
     }
     if (scanState.running) {
       const elapsed = Date.now() - (scanState.startTime || Date.now());
-      if (!scanState.passLabel) return `Sending notifications… ${fmtDuration(elapsed)}`;
+      if (scanState.phase === "sending") return `Sending notifications… ${fmtDuration(elapsed)}`;
+      if (!scanState.passLabel) return `Starting scan… ${fmtDuration(elapsed)}`;
       const remaining = estimateRemaining(elapsed, scanState.tilesDone, scanState.tilesTotal);
       const rem = remaining != null ? ` (${fmtDuration(remaining)} left)` : "";
       return `Scanning ${scanState.passLabel} ${scanState.tilesDone}/${scanState.tilesTotal}… ${fmtDuration(elapsed)}${rem}`;
@@ -2981,6 +3095,11 @@
     sec.appendChild(el("h3", { text: "General settings" }));
     const g = settings.global;
 
+    const bar = el("input", { type: "checkbox" });
+    bar.checked = g.showStatusBar !== false;
+    bar.addEventListener("change", () => { g.showStatusBar = bar.checked; saveSettings(); renderStatusBar(); });
+    sec.appendChild(el("label", { class: "was-check", title: "While Running, show the scan phase, a timer, progress and a Stop button at the top of the map." }, [bar, el("span", { text: "Show status bar on map" })]));
+
     const timing = settings.region ? loadTiming(settings.region) : null;
     const intervalLabel = timing && timing.lastScanMs != null
       ? `Scan interval (minutes) (Last scan ${fmtDuration(timing.lastScanMs)})`
@@ -3151,6 +3270,7 @@
 
     // Inject styles + sidebar tab.
     document.head.appendChild(el("style", { text: STYLE }));
+    try { mapViewportEl = await sdk.Map.getMapViewportElement(); } catch (e) {}
     sdk.Sidebar.registerScriptTab().then(({ tabLabel, tabPane: pane }) => {
       tabLabel.textContent = "Auto Scan";
       tabLabel.title = SCRIPT_NAME;
