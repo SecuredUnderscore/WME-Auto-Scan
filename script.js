@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         WME Auto Scan
 // @namespace    https://github.com/SecuredUnderscore/WME-Auto-Scan
-// @version      0.4.2
-// @description  Scans a selected area in Waze Map Editor for road closures, user edits, update requests, and map suggestions, and sends notifications to Discord or Pushover.
+// @version      0.4.3
+// @description  Scans a selected area in Waze Map Editor for road closures, user edits, update requests, place update requests, and map suggestions, and sends notifications to Discord or Pushover.
 // @author       SecuredUnderscore
 // @match        https://www.waze.com/editor*
 // @match        https://www.waze.com/*/editor*
@@ -18,6 +18,8 @@
 // @connect      nominatim.openstreetmap.org
 // @run-at       document-idle
 // @license      MIT
+// @downloadURL https://update.greasyfork.org/scripts/595728/WME%20Auto%20Scan.user.js
+// @updateURL https://update.greasyfork.org/scripts/595728/WME%20Auto%20Scan.meta.js
 // ==/UserScript==
 
 /* global unsafeWindow, GM_xmlhttpRequest, GM_setValue, GM_getValue */
@@ -35,7 +37,7 @@
   // ---------------------------------------------------------------------------
   const SCRIPT_ID = "wme-auto-scan";
   const SCRIPT_NAME = "WME Auto Scan";
-  const SCRIPT_VERSION = "0.4.2"; // keep in sync with @version above
+  const SCRIPT_VERSION = "0.4.3"; // keep in sync with @version above
   const STORAGE_KEY = "wme-auto-scan:settings:v1";
 
   // --- Map API scanning ----------------------------------------------------
@@ -72,6 +74,7 @@
     edit: 0x3498db, // blue
     report: 0xf1c40f, // yellow
     suggestion: 0x9b59b6, // purple
+    placeRequest: 0x1abc9c, // teal
   };
 
   // WME road-type ids we can't get a localized name for fall back to this map.
@@ -112,6 +115,7 @@
         edit: { ...detector(), cooldownMin: 60 },
         report: detector(),
         suggestion: { ...detector(), includeSegments: true }, // also alert on new-road suggestions
+        placeRequest: detector(),
       },
     };
   }
@@ -1263,12 +1267,13 @@
   }
 
   // ---------------------------------------------------------------------------
-  // Issue Tracker search (Update Requests, Map Suggestions)
+  // Issue Tracker search (Update Requests, Map Suggestions, Place Update Requests)
   // ---------------------------------------------------------------------------
   // The Issue Tracker's bbox search goes over gRPC-web (binary protobuf), so it
   // runs through WME's own client — the call WME makes for its Issue Tracker
-  // layer — with the script's own filters: every open Update Request and open
-  // Map Suggestion, whatever the editor's Issue Tracker filter panel is set to.
+  // layer — with the script's own filters: every open Update Request, open
+  // Map Suggestion and place with Place Update Requests, whatever the editor's
+  // Issue Tracker filter panel is set to.
   // Results are WME model objects; the normalizers below read them the same way
   // the SDK does, so the detectors see SDK-shaped data.
   const ISSUE_TILE_DEG = 1; // 2° boxes returned 400+ results per group with no sign of a cap
@@ -1289,6 +1294,12 @@
     const params = { bbox: box.map((v) => +v.toFixed(6)) };
     if (keys.includes("report")) params.mapUpdateRequestsFilter = { isOpen: true, commentCountRanges: [] };
     if (keys.includes("suggestion")) params.mapSuggestionsFilter = { status: ["OPEN"] };
+    // WME's own default place filter: every category, lock rank, residential
+    // or not, and update type. Places come back with their requests attached.
+    // No `page`: the map search rejects it (WME strips it for map searches too).
+    if (keys.includes("placeRequest")) {
+      params.venueUpdateRequestsFilter = { categories: null, lockRanks: [0, 1, 2, 3, 4, 5], residential: null, types: null };
+    }
     let failures = 0;
     for (;;) {
       if (isStopped()) throw stoppedError();
@@ -1317,7 +1328,7 @@
       // A group that hit a possible cap is re-searched as quarters (items are
       // deduped by id, so overlap with the parent reply is harmless).
       split: (reply, tile) => {
-        const full = ["mapUpdateRequests", "editSuggestions", "segmentSuggestions"].some((k) => count(reply, k) >= ISSUE_SPLIT_AT);
+        const full = ["mapUpdateRequests", "editSuggestions", "segmentSuggestions", "venues"].some((k) => count(reply, k) >= ISSUE_SPLIT_AT);
         if (!full) return null;
         if (tile.box[2] - tile.box[0] <= ISSUE_MIN_TILE_DEG) {
           console.warn("[WME Auto Scan] An Issue Tracker search returned 500+ results in a small area; some may be missing.");
@@ -1555,6 +1566,129 @@
       color: COLORS.suggestion,
       discordDescription: `${md.join("\n")}\n\n${linksMarkdown(links)}`,
       plainText: `Map suggestion\n${plain.join("\n")}\n\n${linksPlain(links)}`,
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Place update request detector ("Place Update Requests")
+  // ---------------------------------------------------------------------------
+  // Pending requests on places (points or areas): new places, changed details,
+  // photos and flags, mostly sent from the Waze app. The search returns each
+  // place with its requests attached; a request is pending while `approved` is
+  // null. One alert per place lists its new requests. Authors are user ids,
+  // resolved through the reply's users so the whitelist can apply.
+  const PLACE_UPDATE_TYPE_NAMES = {
+    ADD_VENUE: "New place", UPDATE_VENUE: "Place update", DELETE_VENUE: "Delete place",
+    ADD_IMAGE: "New photo", UPDATE_IMAGE: "Photo update", DELETE_IMAGE: "Delete photo", flag: "Flag",
+  };
+  const PLACE_REQUEST_LIST_LIMIT = 5; // requests listed per alert
+
+  // get()-or-attribute access: place update requests are WME models read by get().
+  function modelGet(m, key) {
+    if (!m) return undefined;
+    return typeof m.get === "function" ? m.get(key) : modelAttr(m, key);
+  }
+
+  function normalizePlaceRequest(r) {
+    const updateType = modelGet(r, "updateType") || null;
+    return {
+      id: modelGet(r, "id"),
+      isOpen: modelGet(r, "approved") == null,
+      createdBy: modelGet(r, "createdBy") ?? null,
+      dateAdded: modelGet(r, "dateAdded") ?? null,
+      updateType,
+      flagType: updateType === "flag" ? modelGet(r, "type") || null : null,
+      comment: modelGet(r, "comment") || null,
+      fields: [...(modelGet(r, "changedFields") || [])].map((f) => modelGet(f, "fieldName")).filter(Boolean),
+    };
+  }
+
+  function normalizePlace(m) {
+    const requests = modelCall(m, "getUpdateRequests", modelAttr(m, "venueUpdateRequests")) || [];
+    return {
+      id: String(modelCall(m, "getID", modelAttr(m, "id"))),
+      name: modelCall(m, "getName", modelAttr(m, "name")) || null,
+      residential: !!modelCall(m, "isResidential", modelAttr(m, "residential")),
+      geometry: modelAttr(m, "geoJSONGeometry"),
+      requests: [...requests].map(normalizePlaceRequest),
+    };
+  }
+
+  function placeRequestLabel(r) {
+    const type = PLACE_UPDATE_TYPE_NAMES[r.updateType] || r.updateType || "Update request";
+    if (r.flagType) return `${type} (${r.flagType})`;
+    if (r.fields.length) return `${type}: ${r.fields.join(", ")}`;
+    return type;
+  }
+
+  function makePlaceRequestDetector() {
+    const placesById = new Map(); // dedupe across tiles
+    const names = new Map(); // user id -> username, from the replies' users
+    return {
+      key: "placeRequest",
+      collect(reply, tile) {
+        for (const u of (reply.users && reply.users.objects) || []) {
+          const id = modelCall(u, "getID", modelAttr(u, "id"));
+          const name = modelAttr(u, "userName");
+          if (id != null && name) { names.set(String(id), name); noteUsername(name); }
+        }
+        for (const m of (reply.venues && reply.venues.objects) || []) {
+          const place = normalizePlace(m);
+          if (placesById.has(place.id)) continue;                     // cross-tile dedupe
+          place.requests = place.requests.filter((r) => r.id != null && r.isOpen);
+          if (!place.requests.length || !geometryBbox(place.geometry)) continue;
+          if (!tile.inside && !editGeometryInRegion(place.geometry, scanState.region)) continue; // region filter
+          placesById.set(place.id, place);
+        }
+      },
+      async finalize() {
+        const store = seenFor(settings.region, "placeRequest");
+        // Newly seen requests, grouped by place; then mark everything seen.
+        const fresh = [];
+        for (const place of placesById.values()) {
+          const requests = place.requests.filter((r) => !store.ids.has(String(r.id)));
+          for (const r of place.requests) store.ids.add(String(r.id));
+          const shown = requests.filter((r) => !isWhitelisted(names.get(String(r.createdBy))));
+          if (shown.length) fresh.push({ place, requests: shown });
+        }
+        if (!store.baseline) { store.baseline = true; return 0; } // silent first scan
+        let sent = 0;
+        for (const { place, requests } of fresh) {
+          const note = buildPlaceRequestNotification(place, requests, names);
+          const results = await sendNotification("placeRequest", note);
+          if (results.some((x) => x.endsWith(":ok"))) sent++;
+        }
+        return sent;
+      },
+    };
+  }
+
+  function buildPlaceRequestNotification(place, requests, names) {
+    const box = geometryBbox(place.geometry);
+    const centroid = centroidOfBbox(box);
+    const fit = place.geometry.type === "Point" ? null : padBbox(box, 0.15);
+    const link = objectPermalink(editPermalinkBase(), "venue", place.id, fit || box);
+    const links = { ...buildLinks(centroid, [], fit), wme: link };
+    const name = place.name || (place.residential ? "Residential place" : "Unnamed place");
+
+    const shown = requests.slice(0, PLACE_REQUEST_LIST_LIMIT);
+    const more = requests.length - shown.length;
+    const md = [], plain = [];
+    for (const r of shown) {
+      const by = names.get(String(r.createdBy));
+      const added = toDiscordUnix(r.dateAdded);
+      md.push(`- ${placeRequestLabel(r)}${by ? ` by ${by}` : ""}${added ? ` <t:${added}:R>` : ""}`);
+      plain.push(`- ${placeRequestLabel(r)}${by ? ` by ${by}` : ""}${added ? ` (${new Date(added * 1000).toLocaleString()})` : ""}`);
+      if (r.comment) { md.push(`  > ${r.comment}`); plain.push(`  "${r.comment}"`); }
+    }
+    if (more > 0) { md.push(`+${more} more`); plain.push(`+${more} more`); }
+
+    const count = `${requests.length} new request${requests.length === 1 ? "" : "s"}`;
+    return {
+      title: `Place update request: ${name}`.slice(0, 256),
+      color: COLORS.placeRequest,
+      discordDescription: `**${count}**\n${md.join("\n")}\n\n${linksMarkdown(links)}`,
+      plainText: `Place update request: ${name}\n${count}\n${plain.join("\n")}\n\n${linksPlain(links)}`,
     };
   }
 
@@ -1895,6 +2029,7 @@
     if (settings.detectors.closure.enabled) out.push(makeClosureDetector());
     if (settings.detectors.report.enabled) out.push(makeReportDetector());
     if (settings.detectors.suggestion.enabled) out.push(makeSuggestionDetector());
+    if (settings.detectors.placeRequest.enabled) out.push(makePlaceRequestDetector());
     if (settings.detectors.edit.enabled) out.push(makeEditDetector());
     return out;
   }
@@ -1904,7 +2039,8 @@
   // data's server limit:
   //   closures — closures-only replies (~16× smaller than with roads), 1° boxes
   //   edits    — every road type (+ places), boxes under the street cut-off
-  //   issues   — Update Requests + Map Suggestions from the Issue Tracker search
+  //   issues   — Update Requests, Map Suggestions + Place Update Requests from
+  //              the Issue Tracker search
   function plannedPasses(keys = null) {
     const d = settings.detectors;
     const on = keys || Object.keys(d).filter((k) => d[k].enabled);
@@ -1928,7 +2064,7 @@
         fetch: (api, tile) => api.features(tile.box, { roadTypes: ALL_ROAD_TYPES, ...places }),
       });
     }
-    const issueKeys = on.filter((k) => k === "report" || k === "suggestion");
+    const issueKeys = on.filter((k) => k === "report" || k === "suggestion" || k === "placeRequest");
     if (issueKeys.length) passes.push(issuePass(issueKeys, polygon));
     return passes;
   }
@@ -1992,7 +2128,7 @@
   const MASK_STORAGE_PREFIX = "wme-auto-scan:mask:v3:"; // v1/v2 belonged to the map-panning engine
   const MASK_STALE_DAYS = 30;
   const OPTIMIZE_SAVE_EVERY = 50; // persist optimize progress every N boxes (resumable)
-  const OPTIMIZE_HELP = "Optimization only applies to User edits. It checks every User edits box in the region once and remembers which contain road segments, so User edits scans skip the ones without roads (water, wilderness). Places don't count: a place in an area with no roads won't be scanned. Road closures, Update Requests and Map Suggestions always scan the whole region. New roads built in a skipped area aren't seen until you optimize again.";
+  const OPTIMIZE_HELP = "Optimization only applies to User edits. It checks every User edits box in the region once and remembers which contain road segments, so User edits scans skip the ones without roads (water, wilderness). Places don't count: a place in an area with no roads won't be scanned. Road closures, Update Requests, Map Suggestions and Place Update Requests always scan the whole region. New roads built in a skipped area aren't seen until you optimize again.";
   const optimizeState = { running: false, api: null, tilesDone: 0, tilesTotal: 0, startTime: 0, productive: 0 };
 
   // A mask is only usable for the region and box size it was built for.
@@ -2611,6 +2747,13 @@
       sec.appendChild(row);
 
       if (key === "edit" && d.enabled) {
+        // Loading places can multiply scan time; only User edits reads them.
+        // Stored inverted (global.skipPlaces) so earlier choices carry over.
+        const places = el("input", { type: "checkbox" });
+        places.checked = !settings.global.skipPlaces;
+        places.addEventListener("change", () => { settings.global.skipPlaces = !places.checked; saveSettings(); });
+        sec.appendChild(el("label", { class: "was-check", style: "margin-left:24px", title: "Untick for faster scans; edits to places won't be reported." }, [places, el("span", { text: "Include places" })]));
+
         const cooldown = el("input", { type: "number", min: "0", max: "1440", step: "1", value: String(d.cooldownMin) });
         cooldown.addEventListener("change", () => {
           d.cooldownMin = Math.min(1440, Math.max(0, Number(cooldown.value) || 0));
@@ -2844,13 +2987,6 @@
       : "Scan interval (minutes)";
     sec.appendChild(textRow(intervalLabel, g.scanIntervalMin, (v) => { g.scanIntervalMin = Math.max(1, Number(v) || 1); saveSettings(); }, "number"));
 
-    // Loading places can multiply scan time; only User edits reads them.
-    const skipPlaces = el("input", { type: "checkbox" });
-    skipPlaces.checked = !!g.skipPlaces;
-    skipPlaces.addEventListener("change", () => { g.skipPlaces = skipPlaces.checked; saveSettings(); });
-    sec.appendChild(el("label", { class: "was-check" }, [skipPlaces, el("span", { text: "Don't scan places" })]));
-    sec.appendChild(el("div", { class: "was-muted", text: "Faster scans. Edits to places won't be reported.", style: "margin:2px 0 8px 24px" }));
-
     // Notifications: the Discord webhook shows by default; the framed box also
     // acts as a disclosure — clicking its margin (or the chevron) opens the
     // per-detector overrides for hooks, Pushover keys and sounds.
@@ -2960,6 +3096,7 @@
     edit: { name: "User edits", phase1: true },
     report: { name: "Update Requests", phase1: true },
     suggestion: { name: "Map Suggestions", phase1: true },
+    placeRequest: { name: "Place Update Requests", phase1: true },
   };
 
   // ---------------------------------------------------------------------------
