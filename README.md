@@ -15,7 +15,8 @@ This
   - **Update Requests (URs)**
   - **Place Update Requests (PURs)**
   - **Map Suggestions**
-- **Region Selection** — Choose an area from your **managed areas**, **search for a place** (city, county, country via OpenStreetMap), or **draw a polygon**.
+- **Region Selection** — Choose an area from your **managed areas**, **search for a place** (city, county, country via OpenStreetMap), **draw a polygon**, or paste a **WKT polygon**.
+- **Multiple Regions** — Scan several areas, each with its own settings and notifications.
 - **Editor Whitelist** — Ignore events from specific editors.
 
 ---
@@ -37,11 +38,16 @@ Open the **Auto Scan** tab in the sidebar
 
 ### 1. Configuration (Settings Tab)
 
+#### Regions
+- Use the **Regions** dropdown at the top to switch between regions, **Add** a new one, **Duplicate** one, or **Delete** one (click **Confirm** to delete).
+- Each region has its own name, area, and settings. The whitelist is shared by all regions.
+
 #### Region
 1. Under **Choose New Region**, select an option:
    - **Managed area** — Select one of your editable areas.
    - **Search for a place** — Search a location and select a result.
    - **Draw on map** — Click **Draw area on map** and outline a polygon.
+   - **WKT Format** — Click **Open map.wazedev.com** to draw an area, paste its WKT polygon, then click **Use WKT**.
 2. Click **Save**. Click 👁 to view the region outline on the map.
 3. Below the region, **Requests per scan** shows how many requests each scan makes. Click its 👁 to draw them on the map.
 
@@ -55,7 +61,7 @@ Open the **Auto Scan** tab in the sidebar
 ### 2. Scanning (Run Tab)
 
 1. Enable your desired detectors (**Road closures**, **User edits**, **Update Requests**, **Map Suggestions**, **Place Update Requests**). User edits includes edits to places unless you untick **Include places** (faster scans). Map Suggestions includes new-road suggestions unless you untick **Include new-road suggestions**.
-2. Click **Run** to start scanning.
+2. Click **Run** to start scanning. Every region is scanned, one at a time, on its own interval.
 3. Click **Stop** at any time to stop.
 
 ## License

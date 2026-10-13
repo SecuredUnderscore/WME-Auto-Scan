@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME Auto Scan
 // @namespace    https://github.com/SecuredUnderscore/WME-Auto-Scan
-// @version      0.4.4
+// @version      0.5.0
 // @description  Scans a selected area in Waze Map Editor for road closures, user edits, update requests, place update requests, and map suggestions, and sends notifications to Discord or Pushover.
 // @author       SecuredUnderscore
 // @match        https://www.waze.com/editor*
@@ -37,7 +37,7 @@
   // ---------------------------------------------------------------------------
   const SCRIPT_ID = "wme-auto-scan";
   const SCRIPT_NAME = "WME Auto Scan";
-  const SCRIPT_VERSION = "0.4.4"; // keep in sync with @version above
+  const SCRIPT_VERSION = "0.5.0"; // keep in sync with @version above
   const STORAGE_KEY = "wme-auto-scan:settings:v1";
 
   // --- Map API scanning ----------------------------------------------------
@@ -89,44 +89,98 @@
   // ---------------------------------------------------------------------------
   // Settings model + persistence (GM storage)
   // ---------------------------------------------------------------------------
-  function defaultSettings() {
-    const detector = () => ({
-      enabled: false,
-      discordWebhook: "",
-      pushoverToken: "",
-      pushoverUser: "",
-      pushoverSound: "",
-    });
+  // Shared settings (the Run tab's scanner choices, whitelist, status bar) plus
+  // a list of regions. Each region has its own Settings page: name, scan area,
+  // interval, notification channels and per-scanner channel overrides. Run
+  // scans every region, one at a time, each on its own interval.
+  const DETECTOR_KEYS = ["closure", "edit", "report", "suggestion", "placeRequest"];
+  const CHANNEL_FIELDS = ["discordWebhook", "pushoverToken", "pushoverUser", "pushoverSound"];
+
+  function defaultChannels(sound = "") {
+    return { discordWebhook: "", pushoverToken: "", pushoverUser: "", pushoverSound: sound };
+  }
+
+  function newRegionId() {
+    return "g" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+  }
+
+  function defaultRegion(name = "Region 1") {
+    const overrides = {};
+    for (const k of DETECTOR_KEYS) overrides[k] = defaultChannels();
     return {
-      version: 1,
+      id: newRegionId(),
+      name,
+      region: null, // scan area: GeoJSON Polygon coordinates (rings of [lon,lat]) + label
+      scanIntervalMin: 10,
+      notify: defaultChannels("pushover"), // the region's main channels
+      overrides, // per-scanner channels; blank fields fall back to `notify`
+    };
+  }
+
+  function defaultSettings() {
+    const first = defaultRegion();
+    return {
+      version: 2,
       global: {
         showStatusBar: true, // floating bar over the map while Running
-        scanIntervalMin: 10,
-        discordWebhook: "",
-        pushoverToken: "",
-        pushoverUser: "",
-        pushoverSound: "pushover",
         skipPlaces: false, // don't load places while scanning (User edits then covers segments only)
       },
-      whitelist: [], // usernames whose events are suppressed
+      whitelist: [], // usernames whose events are suppressed (every region)
       whitelistSeeded: false, // set once we've added the current user by default
-      region: null, // GeoJSON Polygon coordinates (rings of [lon,lat]) + label
       detectors: {
-        closure: { ...detector(), enabled: true },
-        edit: { ...detector(), cooldownMin: 60 },
-        report: detector(),
-        suggestion: { ...detector(), includeSegments: true }, // also alert on new-road suggestions
-        placeRequest: detector(),
+        closure: { enabled: true },
+        edit: { enabled: false, cooldownMin: 60 },
+        report: { enabled: false },
+        suggestion: { enabled: false, includeSegments: true }, // also alert on new-road suggestions
+        placeRequest: { enabled: false },
       },
+      regions: [first],
+      selectedRegion: first.id, // the region the Settings tab shows
     };
+  }
+
+  // Bring stored or loaded settings to the current shape. Settings from 0.4.x
+  // (one region, its channels in global/detectors) become "Region 1", which
+  // keeps the old storage keys so its edit checkpoints carry over.
+  function normalizeSettings(raw) {
+    const base = defaultSettings();
+    if (!raw || typeof raw !== "object") return base;
+    let src = raw;
+    if (!Array.isArray(raw.regions)) {
+      const g = raw.global || {}, d = raw.detectors || {};
+      const r = defaultRegion();
+      r.legacyStorage = true;
+      r.region = raw.region || null;
+      if (g.scanIntervalMin != null) r.scanIntervalMin = g.scanIntervalMin;
+      for (const f of CHANNEL_FIELDS) {
+        if (g[f] != null) r.notify[f] = g[f];
+        for (const k of DETECTOR_KEYS) if (d[k] && d[k][f] != null) r.overrides[k][f] = d[k][f];
+      }
+      src = { ...raw, regions: [r], selectedRegion: r.id };
+    }
+    const pick = (obj, like) => Object.fromEntries(Object.keys(like).map((k) => [k, obj[k]]));
+    const out = pick(deepMerge(base, src), base); // drops 0.4.x keys and a saved file's extras
+    out.global = pick(out.global, base.global);
+    for (const k of DETECTOR_KEYS) out.detectors[k] = pick(out.detectors[k] || {}, base.detectors[k]);
+    const ids = new Set();
+    out.regions = src.regions.filter((r) => r && typeof r === "object").map((r, i) => {
+      const n = deepMerge(defaultRegion(), r);
+      if (typeof n.id !== "string" || !n.id || ids.has(n.id)) n.id = newRegionId();
+      ids.add(n.id);
+      if (typeof n.name !== "string" || !n.name.trim()) n.name = `Region ${i + 1}`;
+      return n;
+    });
+    if (!out.regions.length) out.regions = [defaultRegion()];
+    if (!out.regions.some((r) => r.id === out.selectedRegion)) out.selectedRegion = out.regions[0].id;
+    out.version = 2;
+    return out;
   }
 
   function loadSettings() {
     try {
       const raw = GM_getValue(STORAGE_KEY, null);
       if (!raw) return defaultSettings();
-      const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
-      return deepMerge(defaultSettings(), parsed);
+      return normalizeSettings(typeof raw === "string" ? JSON.parse(raw) : raw);
     } catch (e) {
       console.error("[WME Auto Scan] failed to load settings, using defaults", e);
       return defaultSettings();
@@ -143,6 +197,18 @@
         console.error("[WME Auto Scan] failed to save settings", e);
       }
     }, 250);
+    // A region added or changed while Running is picked up right away.
+    if (scanState.scheduled && !scanState.running) scheduleNextScan();
+  }
+
+  // The region the Settings tab shows (and optimize / previews act on).
+  function selectedRegion() {
+    return settings.regions.find((r) => r.id === settings.selectedRegion) || settings.regions[0];
+  }
+
+  // Prefix for a region's persisted scan state; "" keeps 0.4.x keys.
+  function regionStoreTag(prof) {
+    return prof.legacyStorage ? "" : prof.id + ":";
   }
 
   function deepMerge(base, override) {
@@ -437,9 +503,9 @@
   // ---------------------------------------------------------------------------
   // Resolve the effective channel config for a detector, applying per-detector
   // overrides on top of the global defaults.
-  function resolveChannels(detectorKey) {
-    const g = settings.global;
-    const d = settings.detectors[detectorKey];
+  function resolveChannels(detectorKey, prof = scanState.profile || selectedRegion()) {
+    const g = prof.notify;
+    const d = prof.overrides[detectorKey];
     return {
       discordWebhook: d.discordWebhook || g.discordWebhook,
       pushoverToken: d.pushoverToken || g.pushoverToken,
@@ -705,6 +771,11 @@
     return tiles;
   }
 
+  // The longer side of a box (optimized closures boxes needn't be square).
+  function boxSpan(box) {
+    return Math.max(box[2] - box[0], box[3] - box[1]);
+  }
+
   function quarterTiles(tile) {
     const [x1, y1, x2, y2] = tile.box;
     const xm = (x1 + x2) / 2, ym = (y1 + y2) / 2;
@@ -796,7 +867,7 @@
 
   // Zoom to the saved region and outline it.
   async function previewRegion() {
-    const region = settings.region;
+    const region = selectedRegion().region;
     if (!region || !region.coordinates) return;
     await ensurePreviewLayers();
     await clearPreview();
@@ -813,7 +884,7 @@
   // Zoom out and draw the request boxes of the finest pass the enabled
   // detectors need (the pass with the most requests).
   async function previewScanBoxes() {
-    const region = settings.region;
+    const region = selectedRegion().region;
     if (!region || !region.coordinates) return;
     await ensurePreviewLayers();
     await clearPreview();
@@ -1036,8 +1107,8 @@
   // the browser-tab session and resets on reload — a reload re-baselines
   // silently instead of re-alerting every closure that already exists.
   const sessionSeen = new Map(); // "<regionKey>:<detector>" -> { baseline, ids:Set }
-  function seenFor(region, detectorKey) {
-    const k = regionKey(region) + ":" + detectorKey;
+  function seenFor(prof, detectorKey) {
+    const k = prof.id + ":" + regionKey(prof.region) + ":" + detectorKey;
     let s = sessionSeen.get(k);
     if (!s) { s = { baseline: false, ids: new Set() }; sessionSeen.set(k, s); }
     return s;
@@ -1078,7 +1149,7 @@
       },
       async finalize(api) {
         const items = [...closuresById.values()];
-        const store = seenFor(settings.region, "closure");
+        const store = seenFor(scanState.profile, "closure");
 
         // Which closures are newly seen this scan? Then mark everything seen.
         const fresh = items.filter((c) => !store.ids.has(c.id));
@@ -1422,7 +1493,7 @@
       },
       async finalize() {
         const items = [...requestsById.values()];
-        const store = seenFor(settings.region, "report");
+        const store = seenFor(scanState.profile, "report");
         // Which requests are newly seen this scan? Then mark everything seen.
         const fresh = items.filter((r) => !store.ids.has(String(r.id)));
         for (const r of items) store.ids.add(String(r.id));
@@ -1503,7 +1574,7 @@
         }
       },
       async finalize() {
-        const store = seenFor(settings.region, "suggestion");
+        const store = seenFor(scanState.profile, "suggestion");
         const fresh = [...suggestionsById.entries()].filter(([key]) => !store.ids.has(key));
         for (const key of suggestionsById.keys()) store.ids.add(key);
         if (!store.baseline) { store.baseline = true; return 0; } // silent first scan
@@ -1643,7 +1714,7 @@
         }
       },
       async finalize() {
-        const store = seenFor(settings.region, "placeRequest");
+        const store = seenFor(scanState.profile, "placeRequest");
         // Newly seen requests, grouped by place; then mark everything seen.
         const fresh = [];
         for (const place of placesById.values()) {
@@ -1908,9 +1979,11 @@
 
   function makeEditDetector() {
     const endpoint = editEndpoint();
-    const region = JSON.parse(JSON.stringify(settings.region));
-    // Full coordinates prevent region-hash collisions from sharing checkpoints.
-    const key = EDIT_STORAGE_PREFIX + endpoint.origin + endpoint.pathname + ":" + regionKey(region);
+    const prof = scanState.profile;
+    const region = JSON.parse(JSON.stringify(prof.region));
+    // Full coordinates prevent region-hash collisions from sharing checkpoints;
+    // the region tag keeps a duplicated region's checkpoints apart.
+    const key = EDIT_STORAGE_PREFIX + regionStoreTag(prof) + endpoint.origin + endpoint.pathname + ":" + regionKey(region);
     const coordinates = JSON.stringify(region.coordinates);
     const raw = GM_getValue(key, null);
     const store = raw ? (typeof raw === "string" ? JSON.parse(raw) : raw) : {
@@ -2015,6 +2088,9 @@
   const scanState = {
     running: false,
     scheduled: false, // interval loop active
+    profile: null, // the region being scanned (settings.regions entry)
+    nextAt: {}, // region id -> ms timestamp it's due again while Running
+    nextRegionName: "", // the region the countdown is waiting for
     polygon: null, // GeoJSON Polygon coordinates
     intervalTimer: null,
     api: null, // the running scan's API client (aborted on Stop)
@@ -2048,26 +2124,27 @@
   //   edits    — every road type (+ places), boxes under the street cut-off
   //   issues   — Update Requests, Map Suggestions + Place Update Requests from
   //              the Issue Tracker search
-  function plannedPasses(keys = null) {
+  function plannedPasses(keys = null, prof = selectedRegion()) {
     const d = settings.detectors;
     const on = keys || Object.keys(d).filter((k) => d[k].enabled);
-    const polygon = settings.region && settings.region.coordinates;
+    const polygon = prof.region && prof.region.coordinates;
     if (!polygon) return [];
+    const mask = loadMask(prof.region);
+    const optimized = !!(mask && mask.complete);
     const passes = [];
     if (on.includes("closure")) {
       passes.push({
-        label: "closures", keys: ["closure"], tiles: regionTiles(polygon, CLOSURE_TILE_DEG),
+        label: "closures", keys: ["closure"], tiles: closureTiles(polygon, mask), optimized,
         // An over-large box comes back with every list empty and no userAreas
         // key, which every real reply carries (even over open ocean).
         fetch: (api, tile) => api.features(tile.box, { roadClosures: true }),
-        refused: (reply, tile) => !("userAreas" in reply) && tile.box[2] - tile.box[0] > CLOSURE_MIN_TILE_DEG,
+        refused: (reply, tile) => !("userAreas" in reply) && boxSpan(tile.box) > CLOSURE_MIN_TILE_DEG,
       });
     }
     if (on.includes("edit")) {
       const places = settings.global.skipPlaces ? {} : { venueLevel: 4, venueFilter: "1,1,1,1" };
-      const mask = loadMask(settings.region);
       passes.push({
-        label: "edits", keys: ["edit"], tiles: editTiles(polygon, mask), optimized: !!(mask && mask.complete),
+        label: "edits", keys: ["edit"], tiles: editTiles(polygon, mask), optimized,
         fetch: (api, tile) => api.features(tile.box, { roadTypes: ALL_ROAD_TYPES, ...places }),
       });
     }
@@ -2122,20 +2199,22 @@
     return state.running;
   }
 
-  // --- User edits optimization -----------------------------------------------
+  // --- Optimization (Road closures + User edits) ----------------------------
   // User edits are scanned in small boxes (ROAD_TILE_DEG), so a large region
   // means thousands of requests — most of them over water or wilderness. An
   // optimize run requests every box once and records which hold any segment
-  // (places are ignored); later User edits scans request only those. A road
-  // created in a skipped box — or an edit to a place with no road nearby — is
-  // missed until the next optimize, so a mask older than
-  // MASK_STALE_DAYS asks to be refreshed. The other detectors always scan the
-  // whole region: closures and Issue Tracker items use large boxes already, and
-  // a "missing road" report sits exactly where no road is.
+  // (places are ignored). The one mask serves two passes:
+  //   edits    — only the boxes with roads
+  //   closures — each 1° box shrinks to its road boxes plus a one-box margin
+  //              (ROAD_TILE_DEG), and is skipped when it has none
+  // A road created in a skipped area, or an edit to a place with no road
+  // nearby, is missed until the next optimize, so a mask older than
+  // MASK_STALE_DAYS asks to be refreshed. Issue Tracker items always scan the
+  // whole region: a "missing road" report sits exactly where no road is.
   const MASK_STORAGE_PREFIX = "wme-auto-scan:mask:v3:"; // v1/v2 belonged to the map-panning engine
   const MASK_STALE_DAYS = 30;
   const OPTIMIZE_SAVE_EVERY = 50; // persist optimize progress every N boxes (resumable)
-  const OPTIMIZE_HELP = "Optimization only applies to User edits. It checks every User edits box in the region once and remembers which contain road segments, so User edits scans skip the ones without roads (water, wilderness). Places don't count: a place in an area with no roads won't be scanned. Road closures, Update Requests, Map Suggestions and Place Update Requests always scan the whole region. New roads built in a skipped area aren't seen until you optimize again.";
+  const OPTIMIZE_HELP = "Optimization applies to Road closures and User edits. It checks the region once in small boxes and remembers which contain road segments, so those scans skip areas without roads (water, wilderness): User edits request only the boxes with roads, Road closures search only around roads (about 7 km of margin). Places don't count: an edit to a place far from any road won't be seen. Update Requests, Map Suggestions and Place Update Requests always scan the whole region. New roads built in a skipped area aren't seen until you optimize again.";
   const optimizeState = { running: false, api: null, tilesDone: 0, tilesTotal: 0, startTime: 0, productive: 0 };
 
   // A mask is only usable for the region and box size it was built for.
@@ -2173,9 +2252,41 @@
     return tiles.filter((t) => keep.has(t.index));
   }
 
+  // The 1° closures boxes a scan requests. Once the region is optimized each
+  // box is cut down to the extent of the road boxes inside it, grown by one
+  // road box of margin; a box with no road nearby is dropped. Both grids start
+  // at the region's bbox corner, so cells map by arithmetic.
+  function closureTiles(polygon, mask) {
+    const step = CLOSURE_TILE_DEG;
+    const tiles = regionTiles(polygon, step);
+    if (!mask || !mask.complete) return tiles;
+    const fine = computeGrid(polygon, ROAD_TILE_DEG), coarse = computeGrid(polygon, step);
+    const m = ROAD_TILE_DEG;
+    const extent = new Map(); // coarse cell index -> trimmed box
+    const cellOf = (v, origin, n) => Math.min(n - 1, Math.max(0, Math.floor((v - origin) / step)));
+    for (const i of mask.productive) {
+      const b = gridCellBox(fine, i);
+      const g = [b[0] - m, b[1] - m, b[2] + m, b[3] + m];
+      const c1 = cellOf(g[0], coarse.x0, coarse.cols), c2 = cellOf(g[2], coarse.x0, coarse.cols);
+      const r1 = cellOf(g[1], coarse.y0, coarse.rows), r2 = cellOf(g[3], coarse.y0, coarse.rows);
+      for (let r = r1; r <= r2; r++) {
+        for (let c = c1; c <= c2; c++) {
+          const idx = r * coarse.cols + c;
+          const t = gridCellBox(coarse, idx);
+          const x1 = Math.max(g[0], t[0]), y1 = Math.max(g[1], t[1]), x2 = Math.min(g[2], t[2]), y2 = Math.min(g[3], t[3]);
+          if (x2 - x1 <= 1e-9 || y2 - y1 <= 1e-9) continue;
+          const e = extent.get(idx);
+          if (!e) extent.set(idx, [x1, y1, x2, y2]);
+          else { e[0] = Math.min(e[0], x1); e[1] = Math.min(e[1], y1); e[2] = Math.max(e[2], x2); e[3] = Math.max(e[3], y2); }
+        }
+      }
+    }
+    return tiles.filter((t) => extent.has(t.index)).map((t) => ({ ...t, box: extent.get(t.index) }));
+  }
+
   async function runOptimize() {
     if (optimizeState.running || scanState.running || scanState.scheduled) return;
-    const region = settings.region;
+    const region = selectedRegion().region;
     if (!region || !region.coordinates) { setStatus("Choose a scan area before optimizing."); return; }
     const tiles = regionTiles(region.coordinates, ROAD_TILE_DEG);
 
@@ -2221,7 +2332,7 @@
         mask.complete = true;
         mask.builtAt = new Date().toISOString();
         saveMask(region, mask);
-        setStatus(`Optimization complete: ${found.size} of ${tiles.length} User edits areas have roads. User edits scans will skip the other ${tiles.length - found.size}.`);
+        setStatus(`Optimization complete: ${found.size} of ${tiles.length} areas have roads. Road closures and User edits scans will skip the rest.`);
       } else {
         setStatus(`Optimization paused at ${start + low}/${tiles.length}. You can resume it later.`);
       }
@@ -2288,21 +2399,23 @@
   // falling back to the previous run's duration before any have finished.
   function estimateRemaining(elapsedMs, done, total) {
     if (done > 0 && total > 0) return Math.max(0, (elapsedMs / done) * total - elapsedMs);
-    const t = settings.region ? loadTiming(settings.region) : null;
+    const prof = scanState.profile;
+    const t = prof && prof.region ? loadTiming(prof.region) : null;
     if (t && t.lastScanMs > 0) return Math.max(0, t.lastScanMs - elapsedMs);
     return null;
   }
 
-  async function runScan() {
+  async function runScan(prof = selectedRegion()) {
     if (scanState.running) return;
     if (optimizeState.running) { setStatus("Optimization is running; this scan was skipped."); return; }
-    if (!settings.region || !settings.region.coordinates) {
+    if (!prof || !prof.region || !prof.region.coordinates) {
       setStatus("Choose a scan area first.");
       return;
     }
     scanState.running = true;
+    scanState.profile = prof;
     scanState.phase = "scanning";
-    scanState.polygon = settings.region.coordinates;
+    scanState.polygon = prof.region.coordinates;
     scanState.region = indexPolygon(scanState.polygon);
     scanState.startTime = Date.now();
     scanState.tilesDone = 0;
@@ -2313,12 +2426,14 @@
     try { detectors = activeDetectors(); }
     catch (e) {
       scanState.running = false;
+      scanState.profile = null;
       scanState.phase = "";
       setStatus("Could not start scan: " + e.message);
       return;
     }
     if (!detectors.length) {
       scanState.running = false;
+      scanState.profile = null;
       scanState.phase = "";
       setStatus("Turn on at least one detector.");
       return;
@@ -2329,7 +2444,7 @@
     try {
       await refreshWmeInfo();
       // Count every pass's tiles up front so progress covers the whole scan.
-      const passes = plannedPasses(detectors.map((d) => d.key));
+      const passes = plannedPasses(detectors.map((d) => d.key), prof);
       scanState.tilesPending = passes.reduce((n, p) => n + p.tiles.length, 0);
       for (const pass of passes) {
         scanState.passLabel = pass.label;
@@ -2357,13 +2472,11 @@
 
       // Record this run's duration (used for "Last scan …" and remaining-time
       // estimates) only when the whole region was scanned.
-      if (settings.region) {
-        saveTiming(settings.region, { lastScanMs: Date.now() - scanState.startTime, lastScanAt: Date.now() });
-      }
+      saveTiming(prof.region, { lastScanMs: Date.now() - scanState.startTime, lastScanAt: Date.now() });
     } catch (e) {
       if (!e.stopped) {
         console.error("[WME Auto Scan] scan failed", e);
-        setStatus("Scan failed: " + e.message);
+        setStatus(`Scan of ${prof.name} failed: ` + e.message);
       }
     } finally {
       api.abort();
@@ -2371,28 +2484,75 @@
       scanState.passLabel = "";
       scanState.phase = "";
       scanState.running = false;
+      scanState.profile = null;
       refreshUI();
     }
   }
 
-  // Interval scheduling: chain the next run after the current one completes so
-  // a slow scan never overlaps the next.
+  // Why a region can't be scanned (short, for lists), or null when it's ready.
+  function regionProblem(prof) {
+    if (!prof.region || !prof.region.coordinates) return "no scan area";
+    const enabled = DETECTOR_KEYS.filter((k) => settings.detectors[k].enabled);
+    if (enabled.length && !enabled.some((k) => channelConfigured(resolveChannels(k, prof)))) return "no notification channel";
+    return null;
+  }
+
+  function regionIntervalMs(prof) {
+    return Math.max(1, Number(prof.scanIntervalMin) || 1) * 60 * 1000;
+  }
+
+  // Interval scheduling: Run scans every ready region, one at a time, each on
+  // its own interval; a region is due again its interval after its last scan
+  // finished, so a slow scan never overlaps the next. Regions added, changed or
+  // deleted while running are picked up on the next round.
   function startScanning() {
     const problem = startBlockReason();
     if (problem) { setStatus(problem); return; }
     scanState.scheduled = true;
+    scanState.nextAt = {};
     loopScan();
     refreshUI();
   }
 
   async function loopScan() {
-    if (!scanState.scheduled) return;
-    await runScan();
-    if (!scanState.scheduled) return;
-    const ms = Math.max(1, settings.global.scanIntervalMin) * 60 * 1000;
-    scanState.cooldownMs = ms;
-    scanState.nextScanAt = Date.now() + ms;
-    scanState.intervalTimer = setTimeout(loopScan, ms);
+    if (!scanState.scheduled || scanState.running) return;
+    clearTimeout(scanState.intervalTimer);
+    scanState.nextScanAt = 0;
+    for (;;) {
+      if (!scanState.scheduled) return;
+      const now = Date.now();
+      const due = settings.regions
+        .filter((r) => !regionProblem(r) && (scanState.nextAt[r.id] || 0) <= now)
+        .sort((a, b) => (scanState.nextAt[a.id] || 0) - (scanState.nextAt[b.id] || 0));
+      if (!due.length) break;
+      const prof = due[0];
+      await runScan(prof);
+      scanState.nextAt[prof.id] = Date.now() + regionIntervalMs(prof);
+    }
+    if (scanState.scheduled) scheduleNextScan();
+  }
+
+  // Wait for the region due soonest (re-planned whenever settings change).
+  function scheduleNextScan() {
+    clearTimeout(scanState.intervalTimer);
+    const ready = settings.regions.filter((r) => !regionProblem(r));
+    if (!ready.length) {
+      // Nothing scannable right now (e.g. its area was cleared); check again soon.
+      scanState.nextScanAt = 0;
+      scanState.nextRegionName = "";
+      scanState.intervalTimer = setTimeout(loopScan, 60000);
+      renderStatus();
+      return;
+    }
+    let next = null;
+    for (const r of ready) {
+      const at = scanState.nextAt[r.id] || Date.now();
+      if (!next || at < next.at) next = { r, at };
+    }
+    scanState.nextScanAt = next.at;
+    scanState.nextRegionName = next.r.name;
+    scanState.cooldownMs = regionIntervalMs(next.r);
+    scanState.intervalTimer = setTimeout(loopScan, Math.max(0, next.at - Date.now()));
     renderStatus(); // the ticker now counts down to nextScanAt
   }
 
@@ -2400,6 +2560,7 @@
     scanState.scheduled = false;
     scanState.running = false;
     scanState.nextScanAt = 0;
+    scanState.nextAt = {};
     clearTimeout(scanState.intervalTimer);
     if (scanState.api) scanState.api.abort();
     setStatus("Stopped.");
@@ -2408,12 +2569,15 @@
 
   function startBlockReason() {
     if (optimizeState.running) return "Wait for optimization to finish (or stop it) before scanning.";
-    if (!settings.region || !settings.region.coordinates) return "Choose a scan area first.";
-    const enabled = Object.keys(settings.detectors).filter((k) => settings.detectors[k].enabled);
+    const enabled = DETECTOR_KEYS.filter((k) => settings.detectors[k].enabled);
     if (!enabled.length) return "Turn on at least one detector.";
-    const configured = enabled.some((k) => channelConfigured(resolveChannels(k)));
-    if (!configured) return "Add a Discord webhook or both Pushover keys, either in settings or for a detector.";
-    return null;
+    if (settings.regions.some((r) => !regionProblem(r))) return null;
+    if (settings.regions.length === 1) {
+      return regionProblem(settings.regions[0]) === "no scan area"
+        ? "Choose a scan area first."
+        : "Add a Discord webhook or both Pushover keys, either in settings or for a detector.";
+    }
+    return "No region is ready to scan: " + settings.regions.map((r) => `${r.name} (${regionProblem(r)})`).join(", ") + ".";
   }
 
   // ---------------------------------------------------------------------------
@@ -2427,7 +2591,7 @@
     const before = (coordinates && coordinates[0] && coordinates[0].length) || 0;
     const simplified = simplifyPolygonCoords(coordinates);
     const after = (simplified && simplified[0] && simplified[0].length) || 0;
-    settings.region = { label, coordinates: simplified, sourcePoints: before, points: after };
+    selectedRegion().region = { label, coordinates: simplified, sourcePoints: before, points: after };
     saveSettings();
     refreshUI();
   }
@@ -2570,7 +2734,7 @@
     .was-section h3 { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--was-muted); margin: 0 0 8px; }
     .was-row { display: flex; flex-direction: column; margin-bottom: 8px; }
     .was-row label { font-weight: 600; margin-bottom: 3px; color: var(--was-text); }
-    .was-wrap input[type=text], .was-wrap input[type=password], .was-wrap input[type=number], .was-wrap select {
+    .was-wrap input[type=text], .was-wrap input[type=password], .was-wrap input[type=number], .was-wrap select, .was-wrap textarea {
       width: 100%; box-sizing: border-box; padding: 5px 7px; border-radius: 4px;
       border: 1px solid var(--was-input-border); background: var(--was-surface); color: var(--was-text); }
     .was-wrap input:focus, .was-wrap select:focus { outline: none; border-color: var(--was-accent); }
@@ -2613,6 +2777,14 @@
       background: var(--was-surface); padding: 6px 26px 6px 7px; cursor: pointer; }
     .was-hook.open { border-color: var(--was-accent); }
     .was-hook > input { border: none !important; background: transparent !important; padding: 2px 0 !important; cursor: text; }
+    .was-hook > .was-hook-title { padding: 2px 0; color: var(--was-text); user-select: none; }
+    .was-region-item { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 5px 6px; border-radius: 5px; }
+    .was-region-item + .was-region-item { margin-top: 2px; }
+    .was-region-item.selected { background: var(--was-hover); }
+    .was-region-name { flex: 1; min-width: 0; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--was-text); }
+    .was-region-item.selected .was-region-name { font-weight: 700; }
+    .was-region-item .was-btn { padding: 3px 8px; }
+    .was-region-confirm { flex-basis: 100%; display: flex; justify-content: flex-end; }
     .was-hook .chev { position: absolute; right: 6px; top: 6px; display: flex; align-items: center; justify-content: center;
       width: 18px; height: 18px; border-radius: 4px; background: var(--was-accent); color: #fff; font-size: 11px; line-height: 1;
       pointer-events: none; transition: transform .15s; }
@@ -2668,6 +2840,9 @@
   let activeTab = "run"; // which sidebar tab is showing
   let regionMethod = ""; // Choose-New-Region mode: "", "managed", "search", "draw"
   let regionDraft = null; // { label, coordinates } staged region, committed on Save
+  let regionChooserOpen = false; // "Choose New Region" dropdown; collapsed until opened
+  let wktText = ""; // WKT pasted for the "WKT Format" method (kept across re-renders)
+  let wktError = ""; // why the pasted WKT couldn't be used
 
   // Transient one-off messages (errors, cancellations, completion notices) take
   // over the status bar briefly; otherwise the bar shows the live timer.
@@ -2696,6 +2871,11 @@
     return pass.keys.map((k) => PASS_DETECTOR_NAMES[k] || k).join(", ");
   }
 
+  // "Region 2 · " while scanning, once there's more than one region.
+  function scanRegionPrefix() {
+    return settings.regions.length > 1 && scanState.profile ? `${scanState.profile.name} · ` : "";
+  }
+
   function statusBarState() {
     const now = Date.now();
     if (scanState.running) {
@@ -2706,13 +2886,14 @@
       // This pass's requests, e.g. "Scanning User Edits (4/8)".
       const passTotal = scanState.tilesTotal - scanState.passTotalAt;
       const phase = scanState.passName && passTotal > 0
-        ? `Scanning ${scanState.passName} (${scanState.tilesDone - scanState.passDoneAt}/${passTotal})`
-        : "Scanning";
+        ? `${scanRegionPrefix()}Scanning ${scanState.passName} (${scanState.tilesDone - scanState.passDoneAt}/${passTotal})`
+        : `${scanRegionPrefix()}Scanning`;
       return { phase, time: elapsed, pct, fromRight: false };
     }
     const left = Math.max(0, scanState.nextScanAt - now);
     const pct = scanState.nextScanAt && scanState.cooldownMs ? Math.min(100, (left / scanState.cooldownMs) * 100) : 0;
-    return { phase: "Cooldown", time: fmtDuration(left), pct, fromRight: true };
+    const next = settings.regions.length > 1 && scanState.nextRegionName ? ` · next: ${scanState.nextRegionName}` : "";
+    return { phase: "Cooldown" + next, time: fmtDuration(left), pct, fromRight: true };
   }
 
   function buildStatusBar() {
@@ -2778,7 +2959,7 @@
       const done = optimizeState.tilesDone, total = optimizeState.tilesTotal;
       const fresh = done - (optimizeState.resumedAt || 0);
       const rem = fresh > 0 && total > done ? ` (${fmtDuration((elapsed / fresh) * (total - done))} left)` : "";
-      return `Optimizing User edits ${done}/${total}… ${fmtDuration(elapsed)}${rem} · ${optimizeState.productive} with roads`;
+      return `Optimizing ${done}/${total}… ${fmtDuration(elapsed)}${rem} · ${optimizeState.productive} with roads`;
     }
     if (scanState.running) {
       const elapsed = Date.now() - (scanState.startTime || Date.now());
@@ -2786,11 +2967,13 @@
       if (!scanState.passLabel) return `Starting scan… ${fmtDuration(elapsed)}`;
       const remaining = estimateRemaining(elapsed, scanState.tilesDone, scanState.tilesTotal);
       const rem = remaining != null ? ` (${fmtDuration(remaining)} left)` : "";
-      return `Scanning ${scanState.passLabel} ${scanState.tilesDone}/${scanState.tilesTotal}… ${fmtDuration(elapsed)}${rem}`;
+      return `Scanning ${scanRegionPrefix()}${scanState.passLabel} ${scanState.tilesDone}/${scanState.tilesTotal}… ${fmtDuration(elapsed)}${rem}`;
     }
     if (scanState.scheduled && scanState.nextScanAt) {
-      return `Next scan in: ${fmtDuration(scanState.nextScanAt - Date.now())}`;
+      const who = settings.regions.length > 1 && scanState.nextRegionName ? ` (${scanState.nextRegionName})` : "";
+      return `Next scan${who} in: ${fmtDuration(scanState.nextScanAt - Date.now())}`;
     }
+    if (scanState.scheduled) return "No region is ready to scan; waiting.";
     return "Ready.";
   }
 
@@ -2817,9 +3000,12 @@
       wrap.appendChild(buildRunControls());
       wrap.appendChild(buildDetectorsSection());
     } else {
+      // The selected region's own page, then what every region shares.
+      wrap.appendChild(buildRegionsSection());
       wrap.appendChild(buildRegionSection());
       wrap.appendChild(buildGeneralSection());
       wrap.appendChild(buildWhitelistSection());
+      wrap.appendChild(buildBackupSection());
     }
 
     tabPane.appendChild(wrap);
@@ -2889,39 +3075,169 @@
     return sec;
   }
 
+  // --- Regions: pick, add, duplicate, delete and rename ----------------------
+  // A dropdown in the same framed style as Notifications: each region is a row
+  // (click the name to edit that region) with Duplicate and Delete; Delete
+  // shows a Confirm button below it. Add sits at the bottom.
+  let regionsOpen = false; // the regions dropdown (closed by default)
+  let regionDeleteArmed = null; // id of the region whose Confirm is showing
+
+  const regionLabel = (r) => (r.name || "").trim() || "Unnamed region";
+
+  function buildRegionsSection() {
+    const sec = el("div", { class: "was-section" });
+    sec.appendChild(el("h3", { text: "Regions" }));
+    const sel = selectedRegion();
+
+    const box = el("div", { class: "was-hook" + (regionsOpen ? " open" : ""), style: "margin-bottom:8px" });
+    const title = el("div", { class: "was-hook-title", text: regionLabel(sel) });
+    box.appendChild(title);
+    box.appendChild(el("span", { class: "chev", text: "▾" }));
+    const panel = el("div", { class: "was-hook-panel" });
+    panel.addEventListener("click", (e) => e.stopPropagation());
+    for (const r of settings.regions) {
+      const item = el("div", { class: "was-region-item" + (r.id === sel.id ? " selected" : "") });
+      item.appendChild(el("div", {
+        class: "was-region-name",
+        text: regionLabel(r),
+        title: r.region ? `Scan area: ${r.region.label}` : "No scan area yet",
+        onclick: () => selectRegion(r.id),
+      }));
+      item.appendChild(el("button", { class: "was-btn secondary", text: "Duplicate", title: "Copy this region and all its settings", onclick: () => duplicateRegion(r) }));
+      const del = el("button", {
+        class: "was-btn danger",
+        text: "Delete",
+        title: "Delete this region (asks you to confirm)",
+        onclick: () => { regionDeleteArmed = regionDeleteArmed === r.id ? null : r.id; refreshUI(); },
+      });
+      if (settings.regions.length === 1) { del.disabled = true; del.title = "The last region can't be deleted."; }
+      item.appendChild(del);
+      if (regionDeleteArmed === r.id) {
+        item.appendChild(el("div", { class: "was-region-confirm" }, [
+          el("button", { class: "was-btn danger", text: "Confirm", title: `Delete ${regionLabel(r)} and its settings`, onclick: () => deleteRegion(r.id) }),
+        ]));
+      }
+      panel.appendChild(item);
+    }
+    panel.appendChild(el("div", { class: "was-btns", style: "margin-top:8px" }, [
+      el("button", { class: "was-btn go", text: "Add", title: "Add a new region with default settings", onclick: addRegion }),
+    ]));
+    box.appendChild(panel);
+    box.addEventListener("click", () => {
+      regionsOpen = !regionsOpen;
+      box.classList.toggle("open", regionsOpen);
+    });
+    sec.appendChild(box);
+
+    sec.appendChild(textRow("Region name", sel.name, (v) => {
+      sel.name = v;
+      title.textContent = regionLabel(sel);
+      saveSettings();
+    }));
+    return sec;
+  }
+
+  // Leave whatever the previous region's page had staged.
+  function resetRegionPage() {
+    regionsOpen = false;
+    regionDeleteArmed = null;
+    regionDraft = null;
+    regionMethod = "";
+    regionChooserOpen = false;
+    wktText = "";
+    wktError = "";
+    clearPreview();
+  }
+
+  function selectRegion(id) {
+    resetRegionPage();
+    settings.selectedRegion = id;
+    saveSettings();
+    refreshUI();
+  }
+
+  function addRegion() {
+    const taken = new Set(settings.regions.map((r) => regionLabel(r)));
+    let n = settings.regions.length + 1;
+    while (taken.has(`Region ${n}`)) n++;
+    const r = defaultRegion(`Region ${n}`);
+    settings.regions.push(r);
+    selectRegion(r.id);
+  }
+
+  // "Region 1" -> "Region 1 (1)" -> "Region 1 (2)": the next free number.
+  function duplicateRegion(src) {
+    const copy = JSON.parse(JSON.stringify(src));
+    copy.id = newRegionId();
+    delete copy.legacyStorage; // its own baselines and edit checkpoints
+    const base = regionLabel(src).replace(/\s*\(\d+\)$/, "");
+    const taken = new Set(settings.regions.map((r) => regionLabel(r)));
+    let n = 1;
+    while (taken.has(`${base} (${n})`)) n++;
+    copy.name = `${base} (${n})`;
+    settings.regions.splice(settings.regions.indexOf(src) + 1, 0, copy);
+    selectRegion(copy.id);
+  }
+
+  function deleteRegion(id) {
+    const i = settings.regions.findIndex((r) => r.id === id);
+    if (i < 0 || settings.regions.length <= 1) return;
+    settings.regions.splice(i, 1);
+    delete scanState.nextAt[id];
+    if (settings.selectedRegion === id) settings.selectedRegion = settings.regions[Math.max(0, i - 1)].id;
+    resetRegionPage();
+    saveSettings();
+    refreshUI();
+  }
+
   function buildRegionSection() {
     const sec = el("div", { class: "was-section" });
-    sec.appendChild(el("h3", { text: "Region" }));
+    sec.appendChild(el("h3", { text: "Scan area" }));
 
     // Current region, with an eye button that zooms to it and outlines it.
     const head = el("div", { style: "display:flex; align-items:center; gap:8px; margin-bottom:8px" });
-    const label = settings.region ? settings.region.label : "No area selected";
+    const label = selectedRegion().region ? selectedRegion().region.label : "No area selected";
     head.appendChild(el("div", { class: "was-region-current", text: label, style: "flex:1; margin:0" }));
-    if (settings.region && settings.region.coordinates) {
+    if (selectedRegion().region && selectedRegion().region.coordinates) {
       head.appendChild(el("button", { class: "was-eye", title: "Show this region on the map", text: "👁", onclick: toggleRegionPreview }));
     }
     sec.appendChild(head);
-    if (settings.region && settings.region.coordinates) sec.appendChild(buildOptimizeRow());
+    if (selectedRegion().region && selectedRegion().region.coordinates) sec.appendChild(buildOptimizeRow());
 
-    // --- Choose New Region: one dropdown holding the three pick methods. -----
+    // --- Choose New Region: the same framed dropdown as Notifications (closed
+    // by default) holding the three pick methods, the staged pick and Save.
+    // The sidebar is rebuilt on every refresh, so its open state lives in
+    // regionChooserOpen.
+    const chooserBox = el("div", { class: "was-hook" + (regionChooserOpen ? " open" : ""), style: "margin-bottom:8px" });
+    chooserBox.appendChild(el("div", { class: "was-hook-title", text: "Choose New Region" }));
+    chooserBox.appendChild(el("span", { class: "chev", text: "▾" }));
+    const body = el("div", { class: "was-hook-panel" });
+    body.addEventListener("click", (e) => e.stopPropagation()); // picking never toggles
+    chooserBox.appendChild(body);
+    chooserBox.addEventListener("click", () => {
+      regionChooserOpen = !regionChooserOpen;
+      chooserBox.classList.toggle("open", regionChooserOpen);
+    });
+
     const chooser = el("select");
-    for (const [value, text] of [["", "Choose New Region"], ["managed", "Managed area"], ["search", "Search for a place"], ["draw", "Draw on map"]]) {
+    for (const [value, text] of [["", "Choose a method…"], ["managed", "Managed area"], ["search", "Search for a place"], ["draw", "Draw on map"], ["wkt", "WKT Format"]]) {
       chooser.appendChild(el("option", { value, text }));
     }
     chooser.value = regionMethod;
     chooser.addEventListener("change", () => { regionMethod = chooser.value; regionDraft = null; refreshUI(); });
-    sec.appendChild(el("div", { class: "was-row" }, [chooser]));
+    body.appendChild(el("div", { class: "was-row" }, [chooser]));
 
-    if (regionMethod === "managed") sec.appendChild(buildManagedAreaPicker());
-    else if (regionMethod === "search") sec.appendChild(buildPlaceSearch());
+    if (regionMethod === "managed") body.appendChild(buildManagedAreaPicker());
+    else if (regionMethod === "search") body.appendChild(buildPlaceSearch());
+    else if (regionMethod === "wkt") body.appendChild(buildWktInput());
     else if (regionMethod === "draw") {
       const drawBtn = el("button", { class: "was-btn secondary", title: "Draw a custom scan area directly on the map", text: regionDraft ? "Redraw area" : "Draw area on map", onclick: drawRegionDraft });
-      sec.appendChild(el("div", { class: "was-btns", style: "margin-bottom:6px" }, [drawBtn]));
+      body.appendChild(el("div", { class: "was-btns", style: "margin-bottom:6px" }, [drawBtn]));
     }
 
     // Staged pick + Save (sits right below the pick methods).
     if (regionDraft) {
-      sec.appendChild(el("div", { class: "was-muted", text: `Selected: ${regionDraft.label}`, style: "margin:2px 0 6px" }));
+      body.appendChild(el("div", { class: "was-muted", text: `Selected: ${regionDraft.label}`, style: "margin:2px 0 6px" }));
     }
     const saveBtn = el("button", {
       class: "was-btn go",
@@ -2932,12 +3248,16 @@
         const d = regionDraft;
         regionDraft = null;
         regionMethod = "";
+        regionChooserOpen = false;
+        wktText = "";
+        wktError = "";
         clearPreview();
         setRegion(d.label, d.coordinates); // calls refreshUI
       },
     });
     if (!regionDraft) saveBtn.disabled = true;
-    sec.appendChild(el("div", { class: "was-btns" }, [saveBtn]));
+    body.appendChild(el("div", { class: "was-btns" }, [saveBtn]));
+    sec.appendChild(chooserBox);
 
     sec.appendChild(buildScanAreasRow());
     return sec;
@@ -2964,6 +3284,63 @@
     else select.appendChild(el("option", { value: "", text: "Loading managed areas…" }));
     managedAreaPresets().then((presets) => { managedPresetsCache = presets; fill(presets); });
     return row;
+  }
+
+  // "WKT Format": paste a POLYGON (e.g. drawn on map.wazedev.com) and stage it.
+  const WKT_TOOL_URL = "https://map.wazedev.com/";
+  function buildWktInput() {
+    const wrap = el("div");
+    const openBtn = el("button", { class: "was-btn secondary", title: "Open map.wazedev.com to draw an area and copy it as WKT", text: "Open map.wazedev.com", onclick: () => window.open(WKT_TOOL_URL, "_blank", "noopener") });
+    wrap.appendChild(el("div", { class: "was-btns", style: "margin-bottom:6px" }, [openBtn]));
+    const area = el("textarea", { rows: "4", placeholder: "POLYGON((lon lat, lon lat, …))", style: "font-family:monospace; font-size:11px; resize:vertical" });
+    area.value = wktText;
+    area.addEventListener("input", () => { wktText = area.value; });
+    wrap.appendChild(el("div", { class: "was-row", style: "margin-bottom:6px" }, [area]));
+    const useBtn = el("button", {
+      class: "was-btn secondary",
+      title: "Read the pasted WKT and select it as the new region",
+      text: "Use WKT",
+      onclick: () => {
+        try {
+          const coordinates = parseWktPolygon(wktText);
+          regionDraft = { label: `WKT area (${coordinates[0].length - 1} points)`, coordinates };
+          wktError = "";
+        } catch (e) {
+          regionDraft = null;
+          wktError = e.message;
+        }
+        refreshUI();
+      },
+    });
+    wrap.appendChild(el("div", { class: "was-btns", style: "margin-bottom:6px" }, [useBtn]));
+    if (wktError) wrap.appendChild(el("div", { class: "was-muted", text: wktError, style: "margin:0 0 6px; color:#b91c1c" }));
+    return wrap;
+  }
+
+  // WKT POLYGON (or single-part MULTIPOLYGON) -> Polygon coordinates: closed
+  // [lon, lat] rings, outer ring first. Throws a readable error otherwise.
+  function parseWktPolygon(text) {
+    const t = String(text || "").trim().replace(/^SRID=\d+;\s*/i, "");
+    const m = /^(MULTI)?POLYGON\s*(?:ZM|Z|M)?\s*\(([\s\S]*)\)$/i.exec(t);
+    if (!m) throw new Error("Paste a WKT polygon, like POLYGON((lon lat, lon lat, …)).");
+    if (m[1] && /\)\s*\)\s*,\s*\(\s*\(/.test(m[2])) throw new Error("This MULTIPOLYGON has several parts; paste a single polygon.");
+    const rings = [];
+    const ringRe = /\(([^()]*)\)/g;
+    let r;
+    while ((r = ringRe.exec(m[2]))) {
+      const ring = r[1].split(",").map((pt) => {
+        const n = pt.trim().split(/\s+/).map(Number);
+        if (n.length < 2 || !Number.isFinite(n[0]) || !Number.isFinite(n[1])) throw new Error(`Couldn't read the point "${pt.trim()}".`);
+        if (Math.abs(n[0]) > 180 || Math.abs(n[1]) > 90) throw new Error(`"${pt.trim()}" isn't longitude latitude in degrees.`);
+        return [n[0], n[1]];
+      });
+      const a = ring[0], b = ring[ring.length - 1];
+      if (a[0] !== b[0] || a[1] !== b[1]) ring.push([a[0], a[1]]);
+      if (ring.length < 4) throw new Error("A polygon needs at least 3 points.");
+      rings.push(ring);
+    }
+    if (!rings.length) throw new Error("No coordinates found in the WKT.");
+    return rings;
   }
 
   function buildPlaceSearch() {
@@ -2995,12 +3372,12 @@
     return wrap;
   }
 
-  // Optimization status + control for User edits, shown under the current region.
+  // Optimization status + control (Road closures + User edits), shown under the current region.
   function buildOptimizeRow() {
     const wrap = el("div", { style: "margin:-2px 0 10px", title: OPTIMIZE_HELP });
-    const mask = loadMask(settings.region);
+    const mask = loadMask(selectedRegion().region);
     const optimized = !!(mask && mask.complete);
-    const total = regionTiles(settings.region.coordinates, ROAD_TILE_DEG).length;
+    const total = regionTiles(selectedRegion().region.coordinates, ROAD_TILE_DEG).length;
     const btns = el("div", { class: "was-btns", style: "align-items:center" });
 
     if (optimizeState.running) {
@@ -3014,7 +3391,7 @@
         text: label,
         title: OPTIMIZE_HELP,
         onclick: () => {
-          if (optimized && !confirm("This region is already optimized for User edits. Optimize it again?")) return;
+          if (optimized && !confirm("This region is already optimized. Optimize it again?")) return;
           runOptimize();
         },
       });
@@ -3026,18 +3403,18 @@
       btns.appendChild(optBtn);
 
       const pill = optimized
-        ? el("span", { class: "was-pill on", text: "Optimized", title: `User edits scans request ${mask.productive.length} of ${total} areas (the rest had no road segments). Built ${new Date(mask.builtAt).toLocaleDateString()}. Only applies to User edits.` })
+        ? el("span", { class: "was-pill on", text: "Optimized", title: `${mask.productive.length} of ${total} areas have road segments; Road closures and User edits skip the rest. Built ${new Date(mask.builtAt).toLocaleDateString()}.` })
         : el("span", { class: "was-pill off", text: resuming ? `Paused ${mask.nextIndex}/${total}` : "Not optimized", title: OPTIMIZE_HELP });
       btns.appendChild(pill);
 
       if (mask) {
-        const clearBtn = el("button", { class: "was-btn secondary", text: "Clear", title: "Discard this region's User edits optimization; User edits scans go back to every area.", onclick: () => { clearMask(settings.region); refreshUI(); } });
+        const clearBtn = el("button", { class: "was-btn secondary", text: "Clear", title: "Discard this region's optimization; Road closures and User edits go back to the whole region.", onclick: () => { clearMask(selectedRegion().region); refreshUI(); } });
         if (busy) clearBtn.disabled = true;
         btns.appendChild(clearBtn);
       }
     }
     wrap.appendChild(btns);
-    wrap.appendChild(el("div", { class: "was-muted", text: "Applies to User edits only.", style: "margin-top:4px" }));
+    wrap.appendChild(el("div", { class: "was-muted", text: "Applies to Road closures and User edits.", style: "margin-top:4px" }));
     if (optimized && maskIsStale(mask)) {
       wrap.appendChild(el("div", { class: "was-muted", text: `Optimized over ${MASK_STALE_DAYS} days ago. Optimize again so new roads are covered.`, style: "margin-top:4px; color:#b45309" }));
     }
@@ -3048,7 +3425,7 @@
   // draws them. Shown inside the region section.
   function buildScanAreasRow() {
     const wrap = el("div", { style: "margin-top:10px; padding-top:8px; border-top:1px solid var(--was-border)" });
-    const hasRegion = !!(settings.region && settings.region.coordinates);
+    const hasRegion = !!(selectedRegion().region && selectedRegion().region.coordinates);
     const btns = el("div", { class: "was-btns", style: "align-items:center" });
     const eye = el("button", { class: "was-eye", title: "Show the scan's request boxes on the map", text: "👁", onclick: toggleBoxesPreview });
     if (!hasRegion) eye.disabled = true;
@@ -3094,17 +3471,20 @@
     const sec = el("div", { class: "was-section" });
     sec.appendChild(el("h3", { text: "General settings" }));
     const g = settings.global;
+    const prof = selectedRegion();
+    const n = prof.notify;
 
+    // A display preference, so it's shared by every region.
     const bar = el("input", { type: "checkbox" });
     bar.checked = g.showStatusBar !== false;
     bar.addEventListener("change", () => { g.showStatusBar = bar.checked; saveSettings(); renderStatusBar(); });
-    sec.appendChild(el("label", { class: "was-check", title: "While Running, show the scan phase, a timer, progress and a Stop button at the top of the map." }, [bar, el("span", { text: "Show status bar on map" })]));
+    sec.appendChild(el("label", { class: "was-check", title: "While Running, show the scan phase, a timer, progress and a Stop button at the top of the map. Applies to every region." }, [bar, el("span", { text: "Show status bar on map (all regions)" })]));
 
-    const timing = settings.region ? loadTiming(settings.region) : null;
+    const timing = prof.region ? loadTiming(prof.region) : null;
     const intervalLabel = timing && timing.lastScanMs != null
       ? `Scan interval (minutes) (Last scan ${fmtDuration(timing.lastScanMs)})`
       : "Scan interval (minutes)";
-    sec.appendChild(textRow(intervalLabel, g.scanIntervalMin, (v) => { g.scanIntervalMin = Math.max(1, Number(v) || 1); saveSettings(); }, "number"));
+    sec.appendChild(textRow(intervalLabel, prof.scanIntervalMin, (v) => { prof.scanIntervalMin = Math.max(1, Number(v) || 1); saveSettings(); }, "number"));
 
     // Notifications: the Discord webhook shows by default; the framed box also
     // acts as a disclosure — clicking its margin (or the chevron) opens the
@@ -3112,9 +3492,9 @@
     sec.appendChild(el("label", { text: "Notifications" }));
     sec.appendChild(buildWebhookDisclosure());
 
-    sec.appendChild(textRow("Pushover app token", g.pushoverToken, (v) => { g.pushoverToken = v.trim(); saveSettings(); }));
-    sec.appendChild(textRow("Pushover user / group key", g.pushoverUser, (v) => { g.pushoverUser = v.trim(); saveSettings(); }));
-    sec.appendChild(selectRow("Pushover sound", g.pushoverSound || "pushover", PUSHOVER_SOUNDS, (v) => { g.pushoverSound = v; saveSettings(); }));
+    sec.appendChild(textRow("Pushover app token", n.pushoverToken, (v) => { n.pushoverToken = v.trim(); saveSettings(); }));
+    sec.appendChild(textRow("Pushover user / group key", n.pushoverUser, (v) => { n.pushoverUser = v.trim(); saveSettings(); }));
+    sec.appendChild(selectRow("Pushover sound", n.pushoverSound || "pushover", PUSHOVER_SOUNDS, (v) => { n.pushoverSound = v; saveSettings(); }));
     return sec;
   }
 
@@ -3122,7 +3502,8 @@
   // overrides. Clicking the framed margin toggles the override panel; typing in
   // the inner input edits the shared webhook and never toggles the panel.
   function buildWebhookDisclosure() {
-    const g = settings.global;
+    const prof = selectedRegion();
+    const g = prof.notify;
     const box = el("div", { class: "was-hook" });
 
     const input = el("input", { type: "text", value: g.discordWebhook || "", placeholder: "Discord webhook URL" });
@@ -3135,7 +3516,7 @@
     panel.addEventListener("click", (e) => e.stopPropagation());
     panel.appendChild(el("div", { class: "was-muted", text: "Leave a field blank to use the main setting.", style: "margin-bottom:6px" }));
     for (const key of Object.keys(DETECTOR_META)) {
-      const d = settings.detectors[key];
+      const d = prof.overrides[key];
       const block = el("div", { class: "was-override" });
       block.appendChild(el("div", { class: "name", text: DETECTOR_META[key].name }));
       block.appendChild(textRow("Discord webhook", d.discordWebhook, (v) => { d.discordWebhook = v.trim(); saveSettings(); }));
@@ -3152,7 +3533,7 @@
 
   function buildWhitelistSection() {
     const sec = el("div", { class: "was-section" });
-    sec.appendChild(el("h3", { text: "Whitelist" }));
+    sec.appendChild(el("h3", { text: "Whitelist (all regions)" }));
 
     const chips = el("div");
     const renderChips = () => {
@@ -3210,6 +3591,57 @@
     return sec;
   }
 
+  // --- Save / load every setting as a JSON file ---------------------------------
+  function buildBackupSection() {
+    const sec = el("div", { class: "was-section" });
+    sec.appendChild(el("h3", { text: "Save / load settings" }));
+
+    const file = el("input", { type: "file", accept: ".json,application/json", style: "display:none" });
+    file.addEventListener("change", async () => {
+      const f = file.files && file.files[0];
+      file.value = ""; // picking the same file again still fires
+      if (!f) return;
+      try { applyLoadedSettings(JSON.parse(await f.text())); }
+      catch (e) { setStatus("Couldn't load settings: " + e.message); }
+    });
+    const saveBtn = el("button", { class: "was-btn secondary", text: "Save", title: "Download all settings as a JSON file", onclick: downloadSettings });
+    const loadBtn = el("button", {
+      class: "was-btn secondary",
+      text: "Load",
+      title: "Replace all settings with a saved JSON file",
+      onclick: () => {
+        if (!confirm("Loading a settings file overwrites ALL current settings: every region, the scanner choices and the whitelist. This can't be undone.\n\nContinue and choose a file?")) return;
+        file.click();
+      },
+    });
+    sec.appendChild(el("div", { class: "was-btns" }, [saveBtn, loadBtn, file]));
+    return sec;
+  }
+
+  function downloadSettings() {
+    const data = JSON.stringify({ ...settings, savedBy: `${SCRIPT_NAME} ${SCRIPT_VERSION}`, savedAt: new Date().toISOString() }, null, 2);
+    const url = URL.createObjectURL(new Blob([data], { type: "application/json" }));
+    const a = el("a", { href: url, download: `wme-auto-scan-settings-${new Date().toISOString().slice(0, 10)}.json` });
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+  }
+
+  // Replace every setting with a loaded file (this version's or 0.4.x's shape).
+  function applyLoadedSettings(raw) {
+    if (!raw || typeof raw !== "object" || !(Array.isArray(raw.regions) || raw.detectors || raw.global)) {
+      throw new Error("that isn't a WME Auto Scan settings file.");
+    }
+    if (scanState.scheduled || scanState.running) stopScanning();
+    if (optimizeState.running) stopOptimize();
+    settings = normalizeSettings(raw);
+    resetRegionPage();
+    saveSettings();
+    refreshUI();
+    setStatus(`Loaded settings: ${settings.regions.length} region${settings.regions.length === 1 ? "" : "s"}.`);
+  }
+
   const DETECTOR_META = {
     closure: { name: "Road closures", phase1: true },
     edit: { name: "User edits", phase1: true },
@@ -3234,13 +3666,14 @@
 
     // Migrate a region stored by an earlier version (raw, un-thinned OSM outline)
     // so its coastline no longer freezes tile culling. Re-simplify in place.
-    if (settings.region && settings.region.coordinates) {
-      const outer = settings.region.coordinates[0] || [];
-      if (!settings.region.points || outer.length > 800) {
-        const simplified = simplifyPolygonCoords(settings.region.coordinates);
-        settings.region.sourcePoints = settings.region.sourcePoints || outer.length;
-        settings.region.coordinates = simplified;
-        settings.region.points = (simplified[0] || []).length;
+    for (const { region } of settings.regions) {
+      if (!region || !region.coordinates) continue;
+      const outer = region.coordinates[0] || [];
+      if (!region.points || outer.length > 800) {
+        const simplified = simplifyPolygonCoords(region.coordinates);
+        region.sourcePoints = region.sourcePoints || outer.length;
+        region.coordinates = simplified;
+        region.points = (simplified[0] || []).length;
         saveSettings();
       }
     }
