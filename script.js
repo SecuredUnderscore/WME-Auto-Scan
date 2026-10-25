@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME Auto Scan
 // @namespace    https://github.com/SecuredUnderscore/WME-Auto-Scan
-// @version      0.6.0
+// @version      0.6.1
 // @description  Scans a selected area in Waze Map Editor for road closures, user edits, update requests, place update requests, and map suggestions, and sends notifications to Discord or Pushover.
 // @author       SecuredUnderscore
 // @match        https://www.waze.com/editor*
@@ -37,7 +37,7 @@
   // ---------------------------------------------------------------------------
   const SCRIPT_ID = "wme-auto-scan";
   const SCRIPT_NAME = "WME Auto Scan";
-  const SCRIPT_VERSION = "0.6.0"; // keep in sync with @version above
+  const SCRIPT_VERSION = "0.6.1"; // keep in sync with @version above
   const STORAGE_KEY = "wme-auto-scan:settings:v1";
 
   // --- Map API scanning ----------------------------------------------------
@@ -89,9 +89,9 @@
   // ---------------------------------------------------------------------------
   // Settings model + persistence (GM storage)
   // ---------------------------------------------------------------------------
-  // Shared settings (the Run tab's scanner choices, global editor lists, status bar) plus
-  // a list of regions. Each region has its own Settings page: name, scan area,
-  // interval, notification channels and per-scanner channel overrides. Run
+  // Shared settings (scan interval, global editor lists, status bar) plus a
+  // list of regions. Each region has its own page: name, scan area, scanners,
+  // notification channels, per-scanner channel overrides and user filter. Run
   // scans every region, one at a time, all on the shared scan interval.
   const DETECTOR_KEYS = ["closure", "edit", "report", "suggestion", "placeRequest"];
   const CHANNEL_FIELDS = ["discordWebhook", "pushoverToken", "pushoverUser", "pushoverSound"];
@@ -118,6 +118,17 @@
     return "g" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
   }
 
+  // A region's scanners (the UI calls detectors "Scanners").
+  function defaultDetectors() {
+    return {
+      closure: { enabled: true },
+      edit: { enabled: false, cooldownMin: 60, includePlaces: true }, // places multiply scan time
+      report: { enabled: false },
+      suggestion: { enabled: false, includeSegments: true }, // also alert on new-road suggestions
+      placeRequest: { enabled: false },
+    };
+  }
+
   function defaultRegion(name = "Region 1") {
     const overrides = {};
     for (const k of DETECTOR_KEYS) overrides[k] = defaultChannels();
@@ -125,6 +136,7 @@
       id: newRegionId(),
       name,
       region: null, // scan area: GeoJSON Polygon coordinates (rings of [lon,lat]) + label
+      detectors: defaultDetectors(),
       notify: defaultChannels("pushover"), // the region's main channels
       overrides, // per-scanner channels; blank fields fall back to `notify`
       userFilter: DEFAULT_USER_FILTER, // see USER_FILTERS
@@ -141,19 +153,10 @@
         scanIntervalMin: 10, // minutes between a region's scans (every region)
         showStatusBar: true, // floating bar over the map while Running
         regionInTitle: true, // prefix alert titles with "[Region name]"
-        skipPlaces: false, // don't load places while scanning (User edits then covers segments only)
-        maxAgeFactor: 2, // skip items older than this × (scan time + interval); 0 = off
       },
       whitelist: [], // Global Whitelist: editors ignored by regions on a whitelist filter
       blacklist: [], // Global Blacklist: the only editors reported by regions on a blacklist filter
       whitelistSeeded: false, // set once we've added the current user by default
-      detectors: {
-        closure: { enabled: true },
-        edit: { enabled: false, cooldownMin: 60 },
-        report: { enabled: false },
-        suggestion: { enabled: false, includeSegments: true }, // also alert on new-road suggestions
-        placeRequest: { enabled: false },
-      },
       regions: [first],
       selectedRegion: first.id, // the region the Regions tab shows
     };
@@ -171,6 +174,7 @@
       const r = defaultRegion();
       r.legacyStorage = true;
       r.region = raw.region || null;
+      delete r.detectors; // take the 0.4.x root `detectors` below, like 0.6.0 files
       for (const f of CHANNEL_FIELDS) {
         if (g[f] != null) r.notify[f] = g[f];
         for (const k of DETECTOR_KEYS) if (d[k] && d[k][f] != null) r.overrides[k][f] = d[k][f];
@@ -187,11 +191,20 @@
       if (from && from.scanIntervalMin != null) out.global.scanIntervalMin = from.scanIntervalMin;
     }
     out.global.scanIntervalMin = Math.max(1, Number(out.global.scanIntervalMin) || 1);
-    for (const k of DETECTOR_KEYS) out.detectors[k] = pick(out.detectors[k] || {}, base.detectors[k]);
+    // Up to 0.6.0 one set of scanners (root `detectors`) and global.skipPlaces
+    // served every region; each region now has its own.
+    const sharedDetectors = src.detectors && typeof src.detectors === "object" ? src.detectors : null;
+    const sharedSkipPlaces = src.global && typeof src.global.skipPlaces === "boolean" ? src.global.skipPlaces : null;
     const ids = new Set();
     out.regions = src.regions.filter((r) => r && typeof r === "object").map((r, i) => {
       const n = deepMerge(defaultRegion(), r);
       delete n.scanIntervalMin; // moved to global (see above)
+      const own = r.detectors && typeof r.detectors === "object" ? r.detectors : null;
+      const from = own || sharedDetectors || {};
+      const dd = defaultDetectors();
+      n.detectors = {};
+      for (const k of DETECTOR_KEYS) n.detectors[k] = pick(deepMerge(dd[k], from[k] && typeof from[k] === "object" ? from[k] : {}), dd[k]);
+      if (!own && sharedSkipPlaces != null) n.detectors.edit.includePlaces = !sharedSkipPlaces;
       if (!USER_FILTERS[n.userFilter]) n.userFilter = DEFAULT_USER_FILTER;
       for (const k of ["whitelist", "blacklist"]) n[k] = Array.isArray(n[k]) ? n[k].filter((x) => typeof x === "string") : [];
       if (typeof n.id !== "string" || !n.id || ids.has(n.id)) n.id = newRegionId();
@@ -929,7 +942,7 @@
     await clearPreview();
     try {
       const passes = plannedPasses();
-      if (!passes.length) { setStatus("Turn on a detector to see its scan areas."); return; }
+      if (!passes.length) { setStatus("Turn on a scanner to see its scan areas."); return; }
       const finest = passes.reduce((a, b) => (b.tiles.length > a.tiles.length ? b : a));
       let tiles = finest.tiles;
       const capped = tiles.length > MAX_PREVIEW_BOXES;
@@ -1050,6 +1063,11 @@
     const level = editorLevel(name);
     const base = md ? `[${name}](${PROFILE_URL(name)})` : name;
     return level ? `${base} (${level})` : base;
+  }
+
+  // The scanners of the region being scanned (else the selected region).
+  function scanDetectors(prof = scanState.profile || selectedRegion()) {
+    return prof.detectors;
   }
 
   function userFilterOf(prof) {
@@ -1202,9 +1220,9 @@
   // within factor × the time since this detector's previous scan of the region
   // when that is longer, so a paused run still reports what happened while it
   // was paused. Older items are marked seen silently.
+  const FRESHNESS_FACTOR = 2;
   function freshnessCutoff(store) {
-    const factor = Number(settings.global.maxAgeFactor);
-    if (!(factor > 0)) return -Infinity;
+    const factor = FRESHNESS_FACTOR;
     const now = Date.now();
     const scanMs = now - scanState.startTime;
     const sinceLast = store.lastScanAt ? now - store.lastScanAt : 0;
@@ -1693,7 +1711,7 @@
   function makeSuggestionDetector() {
     const suggestionsById = new Map(); // "edit:<id>" / "segment:<id>" -> item
     const names = new Map(); // user id -> username, from the replies' users
-    const withSegments = settings.detectors.suggestion.includeSegments !== false;
+    const withSegments = scanDetectors().suggestion.includeSegments !== false;
     return {
       key: "suggestion",
       collect(reply, tile) {
@@ -2122,7 +2140,7 @@
     if (ch.pushoverToken && ch.pushoverUser) channels.push("pushover");
     if (!channels.length) return 0;
     let sent = 0;
-    const cooldown = Math.max(0, Number(settings.detectors.edit.cooldownMin) || 0) * 60000;
+    const cooldown = Math.max(0, Number(scanDetectors().edit.cooldownMin) || 0) * 60000;
     for (const userID of Object.keys(store.pending)) {
       if (!scanState.running) break;
       const events = store.pending[userID];
@@ -2178,7 +2196,7 @@
       key: "edit",
       collect(reply, tile) {
         const lists = [["segment", (reply.segments && reply.segments.objects) || []]];
-        if (!settings.global.skipPlaces) lists.push(["venue", (reply.venues && reply.venues.objects) || []]);
+        if (scanDetectors().edit.includePlaces !== false) lists.push(["venue", (reply.venues && reply.venues.objects) || []]);
         for (const [type, objects] of lists) {
           for (const object of objects) {
             const id = String(object.id);
@@ -2279,13 +2297,14 @@
     passTotalAt: 0,
   };
 
-  function activeDetectors() {
+  function activeDetectors(prof) {
+    const d = scanDetectors(prof);
     const out = [];
-    if (settings.detectors.closure.enabled) out.push(makeClosureDetector());
-    if (settings.detectors.report.enabled) out.push(makeReportDetector());
-    if (settings.detectors.suggestion.enabled) out.push(makeSuggestionDetector());
-    if (settings.detectors.placeRequest.enabled) out.push(makePlaceRequestDetector());
-    if (settings.detectors.edit.enabled) out.push(makeEditDetector());
+    if (d.closure.enabled) out.push(makeClosureDetector());
+    if (d.report.enabled) out.push(makeReportDetector());
+    if (d.suggestion.enabled) out.push(makeSuggestionDetector());
+    if (d.placeRequest.enabled) out.push(makePlaceRequestDetector());
+    if (d.edit.enabled) out.push(makeEditDetector());
     return out;
   }
 
@@ -2297,7 +2316,7 @@
   //   issues   — Update Requests, Map Suggestions + Place Update Requests from
   //              the Issue Tracker search
   function plannedPasses(keys = null, prof = selectedRegion()) {
-    const d = settings.detectors;
+    const d = prof.detectors;
     const on = keys || Object.keys(d).filter((k) => d[k].enabled);
     const polygon = prof.region && prof.region.coordinates;
     if (!polygon) return [];
@@ -2314,7 +2333,7 @@
       });
     }
     if (on.includes("edit")) {
-      const places = settings.global.skipPlaces ? {} : { venueLevel: 4, venueFilter: "1,1,1,1" };
+      const places = d.edit.includePlaces === false ? {} : { venueLevel: 4, venueFilter: "1,1,1,1" };
       passes.push({
         label: "edits", keys: ["edit"], tiles: editTiles(polygon, mask), optimized,
         fetch: (api, tile) => api.features(tile.box, { roadTypes: ALL_ROAD_TYPES, ...places }),
@@ -2595,7 +2614,7 @@
     scanState.tilesPending = 0;
 
     let detectors;
-    try { detectors = activeDetectors(); }
+    try { detectors = activeDetectors(prof); }
     catch (e) {
       scanState.running = false;
       scanState.profile = null;
@@ -2607,7 +2626,7 @@
       scanState.running = false;
       scanState.profile = null;
       scanState.phase = "";
-      setStatus("Turn on at least one detector.");
+      setStatus("Turn on at least one scanner.");
       return;
     }
 
@@ -2664,8 +2683,9 @@
   // Why a region can't be scanned (short, for lists), or null when it's ready.
   function regionProblem(prof) {
     if (!prof.region || !prof.region.coordinates) return "no scan area";
-    const enabled = DETECTOR_KEYS.filter((k) => settings.detectors[k].enabled);
-    if (enabled.length && !enabled.some((k) => channelConfigured(resolveChannels(k, prof)))) return "no notification channel";
+    const enabled = DETECTOR_KEYS.filter((k) => prof.detectors[k].enabled);
+    if (!enabled.length) return "no scanners on";
+    if (!enabled.some((k) => channelConfigured(resolveChannels(k, prof)))) return "no notification channel";
     return null;
   }
 
@@ -2741,13 +2761,12 @@
 
   function startBlockReason() {
     if (optimizeState.running) return "Wait for optimization to finish (or stop it) before scanning.";
-    const enabled = DETECTOR_KEYS.filter((k) => settings.detectors[k].enabled);
-    if (!enabled.length) return "Turn on at least one detector.";
     if (settings.regions.some((r) => !regionProblem(r))) return null;
     if (settings.regions.length === 1) {
-      return regionProblem(settings.regions[0]) === "no scan area"
-        ? "Choose a scan area first."
-        : "Add a Discord webhook or both Pushover keys, either in settings or for a detector.";
+      const problem = regionProblem(settings.regions[0]);
+      if (problem === "no scan area") return "Choose a scan area first.";
+      if (problem === "no scanners on") return "Turn on at least one scanner.";
+      return "Add a Discord webhook or both Pushover keys, either for the region or under Advanced for a scanner.";
     }
     return "No region is ready to scan: " + settings.regions.map((r) => `${r.name} (${regionProblem(r)})`).join(", ") + ".";
   }
@@ -2894,6 +2913,7 @@
       font-size: 12px; line-height: 1.4; padding: 6px 4px 40px; color: var(--was-text);
     }
     .was-wrap h2 { font-size: 15px; margin: 0 0 8px; color: var(--was-text); }
+    .was-wrap h2 .was-version { font-size: 13px; font-weight: normal; margin-left: 6px; color: var(--was-muted); }
 
     .was-tabs { display: flex; gap: 4px; margin-bottom: 10px; border-bottom: 1px solid var(--was-border); }
     .was-tab { flex: 1; text-align: center; cursor: pointer; padding: 7px 10px; font-weight: 600;
@@ -3155,7 +3175,7 @@
     tabPane.innerHTML = "";
     const wrap = el("div", { class: "was-wrap" });
 
-    wrap.appendChild(el("h2", { text: SCRIPT_NAME }));
+    wrap.appendChild(el("h2", { text: SCRIPT_NAME }, [el("span", { class: "was-version", text: `v${SCRIPT_VERSION}` })]));
 
     // Tab bar.
     const tabs = el("div", { class: "was-tabs" });
@@ -3171,11 +3191,11 @@
 
     if (activeTab === "run") {
       wrap.appendChild(buildRunControls());
-      wrap.appendChild(buildDetectorsSection());
     } else if (activeTab === "regions") {
       // The selected region's own page.
       wrap.appendChild(buildRegionsSection());
       wrap.appendChild(buildRegionSection());
+      wrap.appendChild(buildScannersSection());
       wrap.appendChild(buildRegionSettingsSection());
       wrap.appendChild(buildFilteringSection());
     } else {
@@ -3214,12 +3234,14 @@
     return sec;
   }
 
-  function buildDetectorsSection() {
+  // Regions tab: which scanners the selected region runs, and their options.
+  function buildScannersSection() {
+    const prof = selectedRegion();
     const sec = el("div", { class: "was-section" });
-    sec.appendChild(el("h3", { text: "Detectors" }));
+    sec.appendChild(el("h3", { text: "Scanners" }));
     for (const key of Object.keys(DETECTOR_META)) {
       const meta = DETECTOR_META[key];
-      const d = settings.detectors[key];
+      const d = prof.detectors[key];
       const row = el("label", { class: "was-check" + (meta.phase1 ? "" : " disabled") });
       const cb = el("input", { type: "checkbox" });
       cb.checked = d.enabled;
@@ -3231,10 +3253,9 @@
 
       if (key === "edit" && d.enabled) {
         // Loading places can multiply scan time; only User edits reads them.
-        // Stored inverted (global.skipPlaces) so earlier choices carry over.
         const places = el("input", { type: "checkbox" });
-        places.checked = !settings.global.skipPlaces;
-        places.addEventListener("change", () => { settings.global.skipPlaces = !places.checked; saveSettings(); });
+        places.checked = d.includePlaces !== false;
+        places.addEventListener("change", () => { d.includePlaces = places.checked; saveSettings(); });
         sec.appendChild(el("label", { class: "was-check", style: "margin-left:24px", title: "Untick for faster scans; edits to places won't be reported." }, [places, el("span", { text: "Include places" })]));
 
         const cooldown = el("input", { type: "number", min: "0", max: "1440", step: "1", value: String(d.cooldownMin) });
@@ -3619,7 +3640,7 @@
         const passes = plannedPasses();
         summary = passes.length
           ? "Requests per scan: " + passes.map((p) => `${p.tiles.length} ${p.label}${p.optimized ? " (optimized)" : ""}`).join(" · ")
-          : "Turn on a detector to see its scan size.";
+          : "Turn on a scanner to see its scan size.";
       } catch (e) { summary = "Couldn't plan the scan: " + e.message; }
     }
     btns.appendChild(el("span", { class: "was-muted", text: summary }));
@@ -3670,14 +3691,6 @@
     const intervalRow = textRow("Scan interval (minutes)", g.scanIntervalMin, (v) => { g.scanIntervalMin = Math.max(1, Number(v) || 1); saveSettings(); }, "number");
     intervalRow.title = "Minutes between scans of a region. Every region is scanned on this interval, one at a time.";
     sec.appendChild(intervalRow);
-
-    // The freshness window (see freshnessCutoff).
-    const ageRow = textRow("Ignore items older than × (scan time + interval) (0 = off)", g.maxAgeFactor, (v) => {
-      g.maxAgeFactor = Math.max(0, Number(v) || 0);
-      saveSettings();
-    }, "number");
-    ageRow.title = "An item created earlier than this many times (scan time + scan interval) before now was already there during the previous scan, even if the server left it out of that scan's results — it is skipped instead of alerted as new. Keeps long-forgotten suggestions, requests and closures from flooding in when they briefly disappear and come back.";
-    sec.appendChild(ageRow);
     return sec;
   }
 
@@ -3688,40 +3701,29 @@
     const prof = selectedRegion();
     const n = prof.notify;
 
-    const timing = prof.region ? loadTiming(prof.region) : null;
-    if (timing && timing.lastScanMs != null) {
-      sec.appendChild(el("div", { class: "was-muted", style: "margin-bottom:6px", text: `Last scan of this region took ${fmtDuration(timing.lastScanMs)}. The scan interval is on the Settings tab.` }));
-    }
-
-    // Notifications: the Discord webhook shows by default; the framed box also
-    // acts as a disclosure — clicking its margin (or the chevron) opens the
-    // per-detector overrides for hooks, Pushover keys and sounds.
+    // Notifications: the region's channels, then an Advanced dropdown with
+    // per-scanner overrides for hooks, Pushover keys and sounds.
     sec.appendChild(el("label", { text: "Notifications" }));
-    sec.appendChild(buildWebhookDisclosure());
-
+    sec.appendChild(textRow("Discord webhook URL", n.discordWebhook, (v) => { n.discordWebhook = v.trim(); saveSettings(); }));
     sec.appendChild(textRow("Pushover app token", n.pushoverToken, (v) => { n.pushoverToken = v.trim(); saveSettings(); }));
     sec.appendChild(textRow("Pushover user / group key", n.pushoverUser, (v) => { n.pushoverUser = v.trim(); saveSettings(); }));
     sec.appendChild(selectRow("Pushover sound", n.pushoverSound || "pushover", PUSHOVER_SOUNDS, (v) => { n.pushoverSound = v; saveSettings(); }));
+    sec.appendChild(buildAdvancedDisclosure());
     return sec;
   }
 
-  // The Discord webhook field that doubles as a dropdown for per-detector
-  // overrides. Clicking the framed margin toggles the override panel; typing in
-  // the inner input edits the shared webhook and never toggles the panel.
-  function buildWebhookDisclosure() {
+  // "Advanced" dropdown: per-scanner notification overrides. Clicking the
+  // framed title toggles the panel; clicks inside the panel never toggle it.
+  let advancedOpen = false;
+  function buildAdvancedDisclosure() {
     const prof = selectedRegion();
-    const g = prof.notify;
-    const box = el("div", { class: "was-hook" });
-
-    const input = el("input", { type: "text", value: g.discordWebhook || "", placeholder: "Discord webhook URL" });
-    input.addEventListener("input", () => { g.discordWebhook = input.value.trim(); saveSettings(); });
-    input.addEventListener("click", (e) => e.stopPropagation()); // keep typing from toggling
-    box.appendChild(input);
+    const box = el("div", { class: "was-hook" + (advancedOpen ? " open" : ""), style: "margin-top:8px" });
+    box.appendChild(el("div", { class: "was-hook-title", text: "Advanced" }));
     box.appendChild(el("span", { class: "chev", text: "▾" }));
 
     const panel = el("div", { class: "was-hook-panel" });
     panel.addEventListener("click", (e) => e.stopPropagation());
-    panel.appendChild(el("div", { class: "was-muted", text: "Leave a field blank to use the main setting.", style: "margin-bottom:6px" }));
+    panel.appendChild(el("div", { class: "was-muted", text: "Per-scanner notification channels. Leave a field blank to use the region's setting.", style: "margin-bottom:6px" }));
     for (const key of Object.keys(DETECTOR_META)) {
       const d = prof.overrides[key];
       const block = el("div", { class: "was-override" });
@@ -3734,7 +3736,7 @@
     }
     box.appendChild(panel);
 
-    box.addEventListener("click", () => box.classList.toggle("open"));
+    box.addEventListener("click", () => { advancedOpen = !advancedOpen; box.classList.toggle("open", advancedOpen); });
     return box;
   }
 
