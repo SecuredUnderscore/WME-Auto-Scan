@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME Auto Scan
 // @namespace    https://github.com/SecuredUnderscore/WME-Auto-Scan
-// @version      0.5.0
+// @version      0.6.0
 // @description  Scans a selected area in Waze Map Editor for road closures, user edits, update requests, place update requests, and map suggestions, and sends notifications to Discord or Pushover.
 // @author       SecuredUnderscore
 // @match        https://www.waze.com/editor*
@@ -37,7 +37,7 @@
   // ---------------------------------------------------------------------------
   const SCRIPT_ID = "wme-auto-scan";
   const SCRIPT_NAME = "WME Auto Scan";
-  const SCRIPT_VERSION = "0.5.0"; // keep in sync with @version above
+  const SCRIPT_VERSION = "0.6.0"; // keep in sync with @version above
   const STORAGE_KEY = "wme-auto-scan:settings:v1";
 
   // --- Map API scanning ----------------------------------------------------
@@ -89,12 +89,26 @@
   // ---------------------------------------------------------------------------
   // Settings model + persistence (GM storage)
   // ---------------------------------------------------------------------------
-  // Shared settings (the Run tab's scanner choices, whitelist, status bar) plus
+  // Shared settings (the Run tab's scanner choices, global editor lists, status bar) plus
   // a list of regions. Each region has its own Settings page: name, scan area,
   // interval, notification channels and per-scanner channel overrides. Run
-  // scans every region, one at a time, each on its own interval.
+  // scans every region, one at a time, all on the shared scan interval.
   const DETECTOR_KEYS = ["closure", "edit", "report", "suggestion", "placeRequest"];
   const CHANNEL_FIELDS = ["discordWebhook", "pushoverToken", "pushoverUser", "pushoverSound"];
+
+  // A region's user filter: which editor list(s) it uses and how. Whitelist:
+  // the listed editors' events are ignored. Blacklist: only the listed
+  // editors' events are reported. `global` lists live in settings, `region`
+  // lists in the region; "Region + Global" combines both.
+  const USER_FILTERS = {
+    globalWhitelist: { label: "Global Whitelist", mode: "whitelist", region: false, global: true },
+    regionGlobalWhitelist: { label: "Region + Global Whitelist", mode: "whitelist", region: true, global: true },
+    regionWhitelist: { label: "Region Whitelist", mode: "whitelist", region: true, global: false },
+    globalBlacklist: { label: "Global Blacklist", mode: "blacklist", region: false, global: true },
+    regionGlobalBlacklist: { label: "Region + Global Blacklist", mode: "blacklist", region: true, global: true },
+    regionBlacklist: { label: "Region Blacklist", mode: "blacklist", region: true, global: false },
+  };
+  const DEFAULT_USER_FILTER = "globalWhitelist";
 
   function defaultChannels(sound = "") {
     return { discordWebhook: "", pushoverToken: "", pushoverUser: "", pushoverSound: sound };
@@ -111,9 +125,11 @@
       id: newRegionId(),
       name,
       region: null, // scan area: GeoJSON Polygon coordinates (rings of [lon,lat]) + label
-      scanIntervalMin: 10,
       notify: defaultChannels("pushover"), // the region's main channels
       overrides, // per-scanner channels; blank fields fall back to `notify`
+      userFilter: DEFAULT_USER_FILTER, // see USER_FILTERS
+      whitelist: [], // this region's own lists (used by the Region… filters)
+      blacklist: [],
     };
   }
 
@@ -122,10 +138,14 @@
     return {
       version: 2,
       global: {
+        scanIntervalMin: 10, // minutes between a region's scans (every region)
         showStatusBar: true, // floating bar over the map while Running
+        regionInTitle: true, // prefix alert titles with "[Region name]"
         skipPlaces: false, // don't load places while scanning (User edits then covers segments only)
+        maxAgeFactor: 2, // skip items older than this × (scan time + interval); 0 = off
       },
-      whitelist: [], // usernames whose events are suppressed (every region)
+      whitelist: [], // Global Whitelist: editors ignored by regions on a whitelist filter
+      blacklist: [], // Global Blacklist: the only editors reported by regions on a blacklist filter
       whitelistSeeded: false, // set once we've added the current user by default
       detectors: {
         closure: { enabled: true },
@@ -135,7 +155,7 @@
         placeRequest: { enabled: false },
       },
       regions: [first],
-      selectedRegion: first.id, // the region the Settings tab shows
+      selectedRegion: first.id, // the region the Regions tab shows
     };
   }
 
@@ -151,7 +171,6 @@
       const r = defaultRegion();
       r.legacyStorage = true;
       r.region = raw.region || null;
-      if (g.scanIntervalMin != null) r.scanIntervalMin = g.scanIntervalMin;
       for (const f of CHANNEL_FIELDS) {
         if (g[f] != null) r.notify[f] = g[f];
         for (const k of DETECTOR_KEYS) if (d[k] && d[k][f] != null) r.overrides[k][f] = d[k][f];
@@ -161,10 +180,20 @@
     const pick = (obj, like) => Object.fromEntries(Object.keys(like).map((k) => [k, obj[k]]));
     const out = pick(deepMerge(base, src), base); // drops 0.4.x keys and a saved file's extras
     out.global = pick(out.global, base.global);
+    // Settings up to 0.6.0 kept the scan interval per region: carry over the
+    // selected (else first) region's value.
+    if (!(src.global && src.global.scanIntervalMin != null) && Array.isArray(src.regions)) {
+      const from = src.regions.find((r) => r && r.id === src.selectedRegion) || src.regions.find((r) => r && r.scanIntervalMin != null);
+      if (from && from.scanIntervalMin != null) out.global.scanIntervalMin = from.scanIntervalMin;
+    }
+    out.global.scanIntervalMin = Math.max(1, Number(out.global.scanIntervalMin) || 1);
     for (const k of DETECTOR_KEYS) out.detectors[k] = pick(out.detectors[k] || {}, base.detectors[k]);
     const ids = new Set();
     out.regions = src.regions.filter((r) => r && typeof r === "object").map((r, i) => {
       const n = deepMerge(defaultRegion(), r);
+      delete n.scanIntervalMin; // moved to global (see above)
+      if (!USER_FILTERS[n.userFilter]) n.userFilter = DEFAULT_USER_FILTER;
+      for (const k of ["whitelist", "blacklist"]) n[k] = Array.isArray(n[k]) ? n[k].filter((x) => typeof x === "string") : [];
       if (typeof n.id !== "string" || !n.id || ids.has(n.id)) n.id = newRegionId();
       ids.add(n.id);
       if (typeof n.name !== "string" || !n.name.trim()) n.name = `Region ${i + 1}`;
@@ -201,7 +230,7 @@
     if (scanState.scheduled && !scanState.running) scheduleNextScan();
   }
 
-  // The region the Settings tab shows (and optimize / previews act on).
+  // The region the Regions tab shows (and optimize / previews act on).
   function selectedRegion() {
     return settings.regions.find((r) => r.id === settings.selectedRegion) || settings.regions[0];
   }
@@ -518,10 +547,20 @@
     return Boolean(ch.discordWebhook || (ch.pushoverToken && ch.pushoverUser));
   }
 
+  // "[Region name] title" when Include Region Name In Alerts is on. Alerts go
+  // out while a region is being scanned, so that region names them.
+  function withRegionTitle(note) {
+    if (settings.global.regionInTitle === false) return note;
+    const prof = scanState.profile || selectedRegion();
+    if (!prof) return note;
+    return { ...note, title: `[${regionLabel(prof)}] ${note.title}` };
+  }
+
   // A notification is { title, color, discordDescription, plainText }
   async function sendNotification(detectorKey, note, channels = null) {
     const ch = channels || resolveChannels(detectorKey);
     const results = [];
+    note = withRegionTitle(note);
     if (ch.discordWebhook) {
       try {
         await sendDiscord(ch.discordWebhook, note);
@@ -701,7 +740,7 @@
     for (const u of (reply && reply.users && reply.users.objects) || []) {
       if (u && u.id != null && u.userName) {
         names.set(u.id, u.userName);
-        noteUsername(u.userName);
+        noteUsername(u.userName, u.rank);
       }
     }
     return names;
@@ -957,12 +996,16 @@
   }
 
   // The editor's selection is never touched: the segments go in the link's
-  // own segments= parameter.
-  function buildLinks(centroid, segmentIds, bbox) {
+  // own segments= parameter, and `select` ({ type, id }) opens one object by
+  // its own URL key (see PERMALINK_KEYS).
+  function buildLinks(centroid, segmentIds, bbox, select) {
     const links = {};
     let wme = editPermalinkBase();
     if (segmentIds && segmentIds.length) {
       wme += (wme.includes("?") ? "&" : "?") + "segments=" + segmentIds.join(",");
+    }
+    if (select && select.id != null) {
+      wme += `${wme.includes("?") ? "&" : "?"}${PERMALINK_KEYS[select.type] || select.type}=${encodeURIComponent(String(select.id))}`;
     }
     links.wme = permalinkAt(wme, centroid, zoomForBbox(bbox));
     const { lat, lon } = centroid;
@@ -981,17 +1024,53 @@
   }
 
   // ---------------------------------------------------------------------------
-  // Whitelist
+  // User filter (whitelists / blacklists)
   // ---------------------------------------------------------------------------
   const seenUsernames = new Set(); // passively collected this session
+  const userRanks = new Map(); // lowercased username -> WME rank, from every reply's users
 
-  function noteUsername(name) {
-    if (name) seenUsernames.add(name);
+  function noteUsername(name, rank) {
+    if (!name) return;
+    seenUsernames.add(name);
+    if (Number.isInteger(rank) && rank >= 0) userRanks.set(name.toLowerCase(), rank);
   }
 
-  function isWhitelisted(name) {
-    if (!name) return false;
-    return settings.whitelist.some((w) => w.toLowerCase() === name.toLowerCase());
+  // WME shows rank + 1 as the editor level; rank 6 is staff.
+  const STAFF_RANK = 6;
+  function editorLevel(name) {
+    const rank = name ? userRanks.get(name.toLowerCase()) : undefined;
+    if (rank == null) return null;
+    return rank >= STAFF_RANK ? "Staff" : `L${rank + 1}`;
+  }
+
+  // "name (L3)", linked to the profile in Markdown; the level is left out when
+  // the user's rank hasn't come back in any reply.
+  function userLabel(name, md) {
+    if (!name) return "unknown";
+    const level = editorLevel(name);
+    const base = md ? `[${name}](${PROFILE_URL(name)})` : name;
+    return level ? `${base} (${level})` : base;
+  }
+
+  function userFilterOf(prof) {
+    return USER_FILTERS[prof && prof.userFilter] || USER_FILTERS[DEFAULT_USER_FILTER];
+  }
+
+  // The editor names a region's filter checks against (global and/or region
+  // list of the filter's mode).
+  function userFilterNames(prof) {
+    const f = userFilterOf(prof);
+    return [...(f.global ? settings[f.mode] || [] : []), ...(f.region && prof ? prof[f.mode] || [] : [])];
+  }
+
+  // Should this editor's event be dropped under the region's user filter?
+  // Whitelist: dropped when listed. Blacklist: dropped unless listed — an
+  // unknown editor (no name came back) is dropped too, since only listed
+  // editors are reported. Defaults to the region being scanned.
+  function userSuppressed(name, prof = scanState.profile || selectedRegion()) {
+    const f = userFilterOf(prof);
+    const listed = !!name && userFilterNames(prof).some((w) => w.toLowerCase() === name.toLowerCase());
+    return f.mode === "whitelist" ? listed : !listed;
   }
 
   // ---------------------------------------------------------------------------
@@ -1110,8 +1189,40 @@
   function seenFor(prof, detectorKey) {
     const k = prof.id + ":" + regionKey(prof.region) + ":" + detectorKey;
     let s = sessionSeen.get(k);
-    if (!s) { s = { baseline: false, ids: new Set() }; sessionSeen.set(k, s); }
+    if (!s) { s = { baseline: false, ids: new Set(), lastScanAt: 0 }; sessionSeen.set(k, s); }
     return s;
+  }
+
+  // Freshness window. An item first seen this scan but created long before the
+  // previous scan started was in that scan's results already, or should have
+  // been: the server drops items for a scan now and then and returns them the
+  // next — seen as 1000+ three-year-old suggestions vanishing for one scan and
+  // flooding back as "new" the next. So an item is alerted only when it was
+  // created within factor × (this scan's duration + the region's interval), or
+  // within factor × the time since this detector's previous scan of the region
+  // when that is longer, so a paused run still reports what happened while it
+  // was paused. Older items are marked seen silently.
+  function freshnessCutoff(store) {
+    const factor = Number(settings.global.maxAgeFactor);
+    if (!(factor > 0)) return -Infinity;
+    const now = Date.now();
+    const scanMs = now - scanState.startTime;
+    const sinceLast = store.lastScanAt ? now - store.lastScanAt : 0;
+    return now - factor * Math.max(scanMs + scanIntervalMs(), sinceLast);
+  }
+
+  // WME timestamps: epoch ms or seconds, or a date string.
+  function toEpochMs(v) {
+    if (v == null || v === "") return null;
+    if (typeof v === "number") return v > 1e12 ? v : v * 1000;
+    const s = toUnixSeconds(v);
+    return s == null ? null : s * 1000;
+  }
+
+  // Unknown creation times are never stale.
+  function isStale(time, cutoff) {
+    const ms = toEpochMs(time);
+    return ms != null && ms < cutoff;
   }
 
   // Raw Features closure -> the fields the closure detector reads.
@@ -1125,7 +1236,7 @@
       status: raw.closureStatus,
       eventId: raw.eventId || null,
       geometry: raw.geometry,
-      modificationData: { createdBy: users.get(raw.createdBy) || null },
+      modificationData: { createdBy: users.get(raw.createdBy) || null, createdOn: raw.createdOn ?? null },
     };
   }
 
@@ -1151,8 +1262,11 @@
         const items = [...closuresById.values()];
         const store = seenFor(scanState.profile, "closure");
 
-        // Which closures are newly seen this scan? Then mark everything seen.
-        const fresh = items.filter((c) => !store.ids.has(c.id));
+        // Which closures are newly seen this scan (and recent enough to be
+        // new, see freshnessCutoff)? Then mark everything seen.
+        const cutoff = freshnessCutoff(store);
+        store.lastScanAt = Date.now();
+        const fresh = items.filter((c) => !store.ids.has(c.id) && !isStale(c.modificationData.createdOn, cutoff));
         for (const c of items) store.ids.add(c.id);
 
         if (!store.baseline) {
@@ -1168,7 +1282,7 @@
         for (const group of groups) {
           const context = await closureContext(api, group);
           const note = buildClosureNotification(group, context);
-          if (!note) continue; // fully whitelisted
+          if (!note) continue; // every reporter filtered out
           const results = await sendNotification("closure", note);
           if (results.some((r) => r.endsWith(":ok"))) sent++;
         }
@@ -1251,8 +1365,8 @@
   }
 
   function buildClosureNotification(group, context) {
-    // Suppress whole group only if every closure's reporter is whitelisted.
-    const visible = group.filter((c) => !isWhitelisted(c.modificationData.createdBy));
+    // Suppress the whole group only if the user filter drops every reporter.
+    const visible = group.filter((c) => !userSuppressed(c.modificationData.createdBy));
     if (!visible.length) return null;
 
     // Collapse closures onto their segment: a two-way closure produces one
@@ -1278,8 +1392,8 @@
       const name = (seg && context.streets.get(seg.primaryStreetID)) || "Unnamed road";
       const dir = directionLabel(closures);
       const reporters = uniqueReporters(closures);
-      const reporterMd = reporters.map((r) => (r ? `[${r}](${PROFILE_URL(r)})` : "unknown")).join(", ");
-      const reporterPlain = reporters.map((r) => r || "unknown").join(", ");
+      const reporterMd = reporters.map((r) => userLabel(r, true)).join(", ");
+      const reporterPlain = reporters.map((r) => userLabel(r, false)).join(", ");
       // Merge identical timings (forward/reverse usually share one).
       const timings = [...new Set(closures.map(closureTimingMarkdown))];
       const timingsPlain = [...new Set(closures.map(closureTimingPlain))];
@@ -1451,11 +1565,37 @@
       bbox: modelCall(m, "getBbox", modelAttr(m, "bbox")),
       source: modelAttr(m, "source"),
       status: modelCall(m, "getStatus", modelAttr(m, "status")),
-      modificationData: { createdOn: modelCall(m, "getCreatedOn", modelAttr(m, "createdOn")) ?? null },
+      modificationData: {
+        createdOn: modelCall(m, "getCreatedOn", modelAttr(m, "createdOn")) ?? null,
+        createdBy: modelCall(m, "getCreatedBy", modelAttr(m, "createdBy")) ?? null, // user id
+      },
       suggestions: [...suggestions].map((x) => ({
         edits: [...(modelCall(x, "getEntityEdits", x && x.edits) || [])].map((e) => ({ actionType: e.actionType, objectType: e.objectType })),
       })),
     };
+  }
+
+  // Usernames (and ranks) from an Issue Tracker reply's users, by user id.
+  function collectIssueUsers(reply, names) {
+    for (const u of (reply.users && reply.users.objects) || []) {
+      const id = modelCall(u, "getID", modelAttr(u, "id"));
+      const name = modelAttr(u, "userName");
+      if (id != null && name) { names.set(String(id), name); noteUsername(name, modelAttr(u, "rank")); }
+    }
+  }
+
+  // A user id's name: from the replies' users, else from the users WME has
+  // loaded (a suggestion's author isn't always in the search reply).
+  function issueUserName(names, id) {
+    if (id == null) return null;
+    const known = names.get(String(id));
+    if (known) return known;
+    try {
+      const u = PAGE.W.model.users.getObjectById(id);
+      const name = u && modelAttr(u, "userName");
+      if (name) { names.set(String(id), name); noteUsername(name, modelAttr(u, "rank")); return name; }
+    } catch (e) {}
+    return null;
   }
 
   function normalizeSegmentSuggestion(m) {
@@ -1475,7 +1615,7 @@
   // Update request detector ("Update Requests")
   // ---------------------------------------------------------------------------
   // Open user-reported update requests — the map problem reports drivers file
-  // from the app. URs carry no editor username, so the whitelist doesn't apply.
+  // from the app. URs carry no editor username, so the user filter doesn't apply.
   function makeReportDetector() {
     const requestsById = new Map(); // dedupe across tiles
     return {
@@ -1494,8 +1634,11 @@
       async finalize() {
         const items = [...requestsById.values()];
         const store = seenFor(scanState.profile, "report");
-        // Which requests are newly seen this scan? Then mark everything seen.
-        const fresh = items.filter((r) => !store.ids.has(String(r.id)));
+        // Which requests are newly seen this scan (and recent enough to be
+        // new, see freshnessCutoff)? Then mark everything seen.
+        const cutoff = freshnessCutoff(store);
+        store.lastScanAt = Date.now();
+        const fresh = items.filter((r) => !store.ids.has(String(r.id)) && !isStale(r.reportedOn, cutoff));
         for (const r of items) store.ids.add(String(r.id));
         if (!store.baseline) { store.baseline = true; return 0; } // silent first scan
         if (!fresh.length) return 0;
@@ -1512,7 +1655,7 @@
 
   function buildUpdateRequestNotification(r) {
     const [lon, lat] = r.geometry.coordinates;
-    const links = buildLinks({ lat, lon }, []);
+    const links = buildLinks({ lat, lon }, [], null, { type: "report", id: r.id });
     const type = r.updateRequestType ? updateRequestTypeName(r.updateRequestType) : (r.typeText || "Update request");
     const sev = severityLabel(r.severity);
     const src = updateRequestSourceName(r.source);
@@ -1544,13 +1687,17 @@
   // Open map suggestions awaiting review: edit suggestions (suggested changes to
   // existing objects, region-tested by their bbox) and, unless turned off,
   // segment suggestions (proposed new roads, region-tested by their line).
+  // Edit suggestions carry their author's user id, so the user filter applies
+  // to them; new-road suggestions carry only a source and always pass.
   const SUGGESTION_OPEN_STATUSES = new Set(["OPEN", "OPEN_AND_CLOSED"]);
   function makeSuggestionDetector() {
     const suggestionsById = new Map(); // "edit:<id>" / "segment:<id>" -> item
+    const names = new Map(); // user id -> username, from the replies' users
     const withSegments = settings.detectors.suggestion.includeSegments !== false;
     return {
       key: "suggestion",
       collect(reply, tile) {
+        collectIssueUsers(reply, names);
         for (const m of (reply.editSuggestions && reply.editSuggestions.objects) || []) {
           const s = normalizeEditSuggestion(m);
           const key = "edit:" + s.id;
@@ -1575,12 +1722,20 @@
       },
       async finalize() {
         const store = seenFor(scanState.profile, "suggestion");
-        const fresh = [...suggestionsById.entries()].filter(([key]) => !store.ids.has(key));
+        // Newly seen, recent enough to be new (see freshnessCutoff) and, for
+        // edit suggestions, passing the user filter; then mark everything seen.
+        const cutoff = freshnessCutoff(store);
+        store.lastScanAt = Date.now();
+        const createdOn = ({ kind, item }) => (kind === "edit" ? item.modificationData.createdOn : item.createdOn);
+        const author = ({ kind, item }) => (kind === "edit" ? issueUserName(names, item.modificationData.createdBy) : null);
+        const fresh = [...suggestionsById.entries()]
+          .filter(([key, entry]) => !store.ids.has(key) && !isStale(createdOn(entry), cutoff) && (entry.kind !== "edit" || !userSuppressed(author(entry))));
         for (const key of suggestionsById.keys()) store.ids.add(key);
         if (!store.baseline) { store.baseline = true; return 0; } // silent first scan
         let sent = 0;
-        for (const [, { kind, item }] of fresh) {
-          const note = kind === "edit" ? buildSuggestionNotification(item) : buildSegmentSuggestionNotification(item);
+        for (const [, entry] of fresh) {
+          const { kind, item } = entry;
+          const note = kind === "edit" ? buildSuggestionNotification(item, author(entry)) : buildSegmentSuggestionNotification(item);
           const results = await sendNotification("suggestion", note);
           if (results.some((x) => x.endsWith(":ok"))) sent++;
         }
@@ -1589,9 +1744,9 @@
     };
   }
 
-  function buildSuggestionNotification(s) {
+  function buildSuggestionNotification(s, by) {
     const [lon, lat] = bboxCenter(normBbox(s.bbox));
-    const links = buildLinks({ lat, lon }, [], normBbox(s.bbox));
+    const links = buildLinks({ lat, lon }, [], normBbox(s.bbox), { type: "editSuggestion", id: s.id });
     const src = editSuggestionSourceName(s.source);
     const created = toDiscordUnix(s.modificationData && s.modificationData.createdOn);
 
@@ -1602,6 +1757,7 @@
 
     const md = [`**Changes:** ${changeText}`];
     const plain = [`Changes: ${changeText}`];
+    if (by) { md.push(`**Suggested by:** ${userLabel(by, true)}`); plain.push(`Suggested by: ${userLabel(by, false)}`); }
     if (src) { md.push(`**Source:** ${src}`); plain.push(`Source: ${src}`); }
     if (created) {
       md.push(`**Created:** <t:${created}:F> (<t:${created}:R>)`);
@@ -1619,7 +1775,7 @@
   function buildSegmentSuggestionNotification(s) {
     const box = bboxOfRing(s.geometry.coordinates);
     const centroid = centroidOfBbox(box);
-    const links = buildLinks(centroid, [], padBbox(box, 0.15));
+    const links = buildLinks(centroid, [], padBbox(box, 0.15), { type: "segmentSuggestion", id: s.id });
     const src = editSuggestionSourceName(s.source);
     const created = toDiscordUnix(s.createdOn);
     const road = [s.streetName || "Unnamed road", s.roadType != null ? roadTypeName(s.roadType) : null].filter(Boolean).join(" — ");
@@ -1648,7 +1804,7 @@
   // photos and flags, mostly sent from the Waze app. The search returns each
   // place with its requests attached; a request is pending while `approved` is
   // null. One alert per place lists its new requests. Authors are user ids,
-  // resolved through the reply's users so the whitelist can apply.
+  // resolved through the reply's users so the user filter can apply.
   const PLACE_UPDATE_TYPE_NAMES = {
     ADD_VENUE: "New place", UPDATE_VENUE: "Place update", DELETE_VENUE: "Delete place",
     ADD_IMAGE: "New photo", UPDATE_IMAGE: "Photo update", DELETE_IMAGE: "Delete photo", flag: "Flag",
@@ -1699,11 +1855,7 @@
     return {
       key: "placeRequest",
       collect(reply, tile) {
-        for (const u of (reply.users && reply.users.objects) || []) {
-          const id = modelCall(u, "getID", modelAttr(u, "id"));
-          const name = modelAttr(u, "userName");
-          if (id != null && name) { names.set(String(id), name); noteUsername(name); }
-        }
+        collectIssueUsers(reply, names);
         for (const m of (reply.venues && reply.venues.objects) || []) {
           const place = normalizePlace(m);
           if (placesById.has(place.id)) continue;                     // cross-tile dedupe
@@ -1715,12 +1867,15 @@
       },
       async finalize() {
         const store = seenFor(scanState.profile, "placeRequest");
-        // Newly seen requests, grouped by place; then mark everything seen.
+        // Newly seen requests (recent enough to be new, see freshnessCutoff),
+        // grouped by place; then mark everything seen.
+        const cutoff = freshnessCutoff(store);
+        store.lastScanAt = Date.now();
         const fresh = [];
         for (const place of placesById.values()) {
-          const requests = place.requests.filter((r) => !store.ids.has(String(r.id)));
+          const requests = place.requests.filter((r) => !store.ids.has(String(r.id)) && !isStale(r.dateAdded, cutoff));
           for (const r of place.requests) store.ids.add(String(r.id));
-          const shown = requests.filter((r) => !isWhitelisted(names.get(String(r.createdBy))));
+          const shown = requests.filter((r) => !userSuppressed(issueUserName(names, r.createdBy)));
           if (shown.length) fresh.push({ place, requests: shown });
         }
         if (!store.baseline) { store.baseline = true; return 0; } // silent first scan
@@ -1747,10 +1902,10 @@
     const more = requests.length - shown.length;
     const md = [], plain = [];
     for (const r of shown) {
-      const by = names.get(String(r.createdBy));
+      const by = issueUserName(names, r.createdBy);
       const added = toDiscordUnix(r.dateAdded);
-      md.push(`- ${placeRequestLabel(r)}${by ? ` by ${by}` : ""}${added ? ` <t:${added}:R>` : ""}`);
-      plain.push(`- ${placeRequestLabel(r)}${by ? ` by ${by}` : ""}${added ? ` (${new Date(added * 1000).toLocaleString()})` : ""}`);
+      md.push(`- ${placeRequestLabel(r)}${by ? ` by ${userLabel(by, true)}` : ""}${added ? ` <t:${added}:R>` : ""}`);
+      plain.push(`- ${placeRequestLabel(r)}${by ? ` by ${userLabel(by, false)}` : ""}${added ? ` (${new Date(added * 1000).toLocaleString()})` : ""}`);
       if (r.comment) { md.push(`  > ${r.comment}`); plain.push(`  "${r.comment}"`); }
     }
     if (more > 0) { md.push(`+${more} more`); plain.push(`+${more} more`); }
@@ -1847,7 +2002,7 @@
       if (!scanState.running) throw new Error("History paused");
       const page = await fetchEditHistory(endpoint, item, cursor);
       for (const user of page.users?.objects || []) {
-        if (typeof user.userName === "string") users.set(String(user.id), user.userName);
+        if (typeof user.userName === "string") { users.set(String(user.id), user.userName); noteUsername(user.userName, user.rank); }
       }
       let older = false;
       for (const tx of page.transactions.objects) {
@@ -1896,20 +2051,36 @@
     };
   }
 
-  // Base WME permalink for the current map view, stripped of any object
-  // selection so we can append a single segment/place per link below.
+  // Base WME permalink: the editor's current view and nothing else. WME's
+  // permalink also carries whatever the editor has selected or open
+  // (segments=, venues=, mapUpdateRequest=, majorTrafficEvents=, mapProblem=,
+  // mapComments=, …), and any of those would open that object instead of the
+  // alert's, so only the view parameters are kept.
+  const PERMALINK_VIEW_PARAMS = ["env", "s", "lon", "lat", "zoomLevel"];
   function editPermalinkBase() {
-    return wme.permalink // cached by refreshWmeInfo()
-      .replace(/([?&])(segments|venues)=[^&]*/g, "$1")
-      .replace(/&&+/g, "&").replace(/\?&/, "?").replace(/[?&]$/, "");
+    const permalink = wme.permalink; // cached by refreshWmeInfo()
+    try {
+      const url = new URL(permalink, "https://www.waze.com");
+      const kept = PERMALINK_VIEW_PARAMS.filter((k) => url.searchParams.has(k)).map((k) => `${k}=${encodeURIComponent(url.searchParams.get(k))}`);
+      return `${url.origin}${url.pathname}${kept.length ? "?" + kept.join("&") : ""}`;
+    } catch (e) {
+      return String(permalink).split("?")[0];
+    }
   }
 
+  // The URL key WME reads on load to open each kind of object: segments and
+  // venues take comma lists, the issue keys one id.
+  const PERMALINK_KEYS = {
+    segment: "segments", venue: "venues",
+    report: "mapUpdateRequest", editSuggestion: "editSuggestions", segmentSuggestion: "segmentSuggestions",
+  };
+
   function objectPermalink(base, type, id, bbox) {
-    const param = type === "venue" ? "venues" : "segments";
+    const param = PERMALINK_KEYS[type] || type;
     // Land on and fit the object, and select it via the id param, rather than
     // inheriting the last scanned tile's view.
     const at = permalinkAt(base, bbox && centroidOfBbox(bbox), zoomForBbox(bbox));
-    return `${at}${at.includes("?") ? "&" : "?"}${param}=${id}`;
+    return `${at}${at.includes("?") ? "&" : "?"}${param}=${encodeURIComponent(String(id))}`;
   }
 
   const EDIT_PERMALINK_LIMIT = 3;
@@ -1935,8 +2106,9 @@
     }
     const dates = events.map((e) => e.date);
     const period = `${new Date(dates.reduce((a, b) => Math.min(a, b), Infinity)).toLocaleString()} – ${new Date(dates.reduce((a, b) => Math.max(a, b), 0)).toLocaleString()}`;
+    const level = editorLevel(name);
     return {
-      title: `User edits: ${name}`,
+      title: `User edits: ${name}${level ? ` (${level})` : ""}`,
       color: COLORS.edit,
       discordDescription: `${period}\n${lines.join("\n")}\n\n[User Profile](${PROFILE_URL(name)})`,
       plainText: `${period}\n${plainLines.join("\n")}\n\nUser Profile: ${PROFILE_URL(name)}`,
@@ -1955,7 +2127,7 @@
       if (!scanState.running) break;
       const events = store.pending[userID];
       if (!events.length) continue;
-      if (isWhitelisted(events[0].name)) { delete store.pending[userID]; persist(); continue; }
+      if (userSuppressed(events[0].name)) { delete store.pending[userID]; persist(); continue; }
       const last = store.lastSent[userID];
       // Partially delivered events retry immediately, even during cooldown.
       if (last && Date.now() - last < cooldown && !events.some((e) => e.delivered.length)) continue;
@@ -2056,7 +2228,7 @@
               await readNewEditEvents(endpoint, item, checkpoint, budget);
             for (const event of result.events) {
               noteUsername(event.name);
-              if (isWhitelisted(event.name)) continue;
+              if (userSuppressed(event.name)) continue;
               const events = store.pending[event.userID] || (store.pending[event.userID] = []);
               if (!events.some((e) => e.id === event.id && e.type === event.type && e.objectId === event.objectId)) events.push(event);
             }
@@ -2497,12 +2669,12 @@
     return null;
   }
 
-  function regionIntervalMs(prof) {
-    return Math.max(1, Number(prof.scanIntervalMin) || 1) * 60 * 1000;
+  function scanIntervalMs() {
+    return Math.max(1, Number(settings.global.scanIntervalMin) || 1) * 60 * 1000;
   }
 
-  // Interval scheduling: Run scans every ready region, one at a time, each on
-  // its own interval; a region is due again its interval after its last scan
+  // Interval scheduling: Run scans every ready region, one at a time, on the
+  // shared interval; a region is due again one interval after its last scan
   // finished, so a slow scan never overlaps the next. Regions added, changed or
   // deleted while running are picked up on the next round.
   function startScanning() {
@@ -2527,7 +2699,7 @@
       if (!due.length) break;
       const prof = due[0];
       await runScan(prof);
-      scanState.nextAt[prof.id] = Date.now() + regionIntervalMs(prof);
+      scanState.nextAt[prof.id] = Date.now() + scanIntervalMs();
     }
     if (scanState.scheduled) scheduleNextScan();
   }
@@ -2551,7 +2723,7 @@
     }
     scanState.nextScanAt = next.at;
     scanState.nextRegionName = next.r.name;
-    scanState.cooldownMs = regionIntervalMs(next.r);
+    scanState.cooldownMs = scanIntervalMs();
     scanState.intervalTimer = setTimeout(loopScan, Math.max(0, next.at - Date.now()));
     renderStatus(); // the ticker now counts down to nextScanAt
   }
@@ -2651,7 +2823,7 @@
   }
 
   // Collect the editor usernames attached to whatever is loaded in the current
-  // view — used to auto-fill the whitelist. Most data-model objects carry a
+  // view — used to auto-fill the editor lists. Most data-model objects carry a
   // resolved createdBy/updatedBy, so we sweep the common ones.
   async function scrapeAreaUsernames() {
     const names = new Set();
@@ -2838,6 +3010,7 @@
   ];
 
   let activeTab = "run"; // which sidebar tab is showing
+  let scrollTarget = null; // element id to scroll to after the next refreshUI()
   let regionMethod = ""; // Choose-New-Region mode: "", "managed", "search", "draw"
   let regionDraft = null; // { label, coordinates } staged region, committed on Save
   let regionChooserOpen = false; // "Choose New Region" dropdown; collapsed until opened
@@ -2986,7 +3159,7 @@
 
     // Tab bar.
     const tabs = el("div", { class: "was-tabs" });
-    for (const [id, name] of [["run", "Run"], ["settings", "Settings"]]) {
+    for (const [id, name] of [["run", "Run"], ["regions", "Regions"], ["settings", "Settings"]]) {
       const t = el("div", { class: "was-tab" + (activeTab === id ? " active" : ""), text: name });
       t.addEventListener("click", () => { activeTab = id; refreshUI(); });
       tabs.appendChild(t);
@@ -2999,16 +3172,26 @@
     if (activeTab === "run") {
       wrap.appendChild(buildRunControls());
       wrap.appendChild(buildDetectorsSection());
-    } else {
-      // The selected region's own page, then what every region shares.
+    } else if (activeTab === "regions") {
+      // The selected region's own page.
       wrap.appendChild(buildRegionsSection());
       wrap.appendChild(buildRegionSection());
-      wrap.appendChild(buildGeneralSection());
-      wrap.appendChild(buildWhitelistSection());
+      wrap.appendChild(buildRegionSettingsSection());
+      wrap.appendChild(buildFilteringSection());
+    } else {
+      // What every region shares.
+      wrap.appendChild(buildGlobalSection());
+      wrap.appendChild(buildUserListSection("Global Whitelist", settings, "whitelist", "Editors ignored by every region whose user filter uses the Global Whitelist.", "was-global-whitelist"));
+      wrap.appendChild(buildUserListSection("Global Blacklist", settings, "blacklist", "The only editors reported by regions whose user filter uses the Global Blacklist.", "was-global-blacklist"));
       wrap.appendChild(buildBackupSection());
     }
 
     tabPane.appendChild(wrap);
+    if (scrollTarget) {
+      const target = wrap.querySelector("#" + scrollTarget);
+      scrollTarget = null;
+      if (target) target.scrollIntoView({ block: "start", behavior: "smooth" });
+    }
     renderStatus();
   }
 
@@ -3458,8 +3641,9 @@
     row.appendChild(el("label", { text: labelText }));
     const select = el("select");
     for (const opt of options) {
-      const o = el("option", { value: opt, text: opt });
-      if (opt === value) o.selected = true;
+      const { value: v, label } = opt && typeof opt === "object" ? opt : { value: opt, label: opt };
+      const o = el("option", { value: v, text: label });
+      if (v === value) o.selected = true;
       select.appendChild(o);
     }
     select.addEventListener("change", () => onChange(select.value));
@@ -3467,24 +3651,47 @@
     return row;
   }
 
-  function buildGeneralSection() {
+  // Settings tab: what every region shares.
+  function buildGlobalSection() {
     const sec = el("div", { class: "was-section" });
     sec.appendChild(el("h3", { text: "General settings" }));
     const g = settings.global;
-    const prof = selectedRegion();
-    const n = prof.notify;
 
-    // A display preference, so it's shared by every region.
     const bar = el("input", { type: "checkbox" });
     bar.checked = g.showStatusBar !== false;
     bar.addEventListener("change", () => { g.showStatusBar = bar.checked; saveSettings(); renderStatusBar(); });
-    sec.appendChild(el("label", { class: "was-check", title: "While Running, show the scan phase, a timer, progress and a Stop button at the top of the map. Applies to every region." }, [bar, el("span", { text: "Show status bar on map (all regions)" })]));
+    sec.appendChild(el("label", { class: "was-check", title: "While Running, show the scan phase, a timer, progress and a Stop button at the top of the map." }, [bar, el("span", { text: "Show status bar on map" })]));
+
+    const regionName = el("input", { type: "checkbox" });
+    regionName.checked = g.regionInTitle !== false;
+    regionName.addEventListener("change", () => { g.regionInTitle = regionName.checked; saveSettings(); });
+    sec.appendChild(el("label", { class: "was-check", title: "Start every alert's title with the region's name in brackets, e.g. \"[Downtown] Road closure\"." }, [regionName, el("span", { text: "Include Region Name In Alerts" })]));
+
+    const intervalRow = textRow("Scan interval (minutes)", g.scanIntervalMin, (v) => { g.scanIntervalMin = Math.max(1, Number(v) || 1); saveSettings(); }, "number");
+    intervalRow.title = "Minutes between scans of a region. Every region is scanned on this interval, one at a time.";
+    sec.appendChild(intervalRow);
+
+    // The freshness window (see freshnessCutoff).
+    const ageRow = textRow("Ignore items older than × (scan time + interval) (0 = off)", g.maxAgeFactor, (v) => {
+      g.maxAgeFactor = Math.max(0, Number(v) || 0);
+      saveSettings();
+    }, "number");
+    ageRow.title = "An item created earlier than this many times (scan time + scan interval) before now was already there during the previous scan, even if the server left it out of that scan's results — it is skipped instead of alerted as new. Keeps long-forgotten suggestions, requests and closures from flooding in when they briefly disappear and come back.";
+    sec.appendChild(ageRow);
+    return sec;
+  }
+
+  // Regions tab: the selected region's notification channels.
+  function buildRegionSettingsSection() {
+    const sec = el("div", { class: "was-section" });
+    sec.appendChild(el("h3", { text: "Region settings" }));
+    const prof = selectedRegion();
+    const n = prof.notify;
 
     const timing = prof.region ? loadTiming(prof.region) : null;
-    const intervalLabel = timing && timing.lastScanMs != null
-      ? `Scan interval (minutes) (Last scan ${fmtDuration(timing.lastScanMs)})`
-      : "Scan interval (minutes)";
-    sec.appendChild(textRow(intervalLabel, prof.scanIntervalMin, (v) => { prof.scanIntervalMin = Math.max(1, Number(v) || 1); saveSettings(); }, "number"));
+    if (timing && timing.lastScanMs != null) {
+      sec.appendChild(el("div", { class: "was-muted", style: "margin-bottom:6px", text: `Last scan of this region took ${fmtDuration(timing.lastScanMs)}. The scan interval is on the Settings tab.` }));
+    }
 
     // Notifications: the Discord webhook shows by default; the framed box also
     // acts as a disclosure — clicking its margin (or the chevron) opens the
@@ -3531,21 +3738,68 @@
     return box;
   }
 
-  function buildWhitelistSection() {
+  // Regions tab: the selected region's user filter (see USER_FILTERS), with
+  // the region's own list below it when the filter uses one, and a shortcut to
+  // the matching global list on the Settings tab.
+  function buildFilteringSection() {
+    const prof = selectedRegion();
+    const f = userFilterOf(prof);
+    const frag = document.createDocumentFragment();
+
     const sec = el("div", { class: "was-section" });
-    sec.appendChild(el("h3", { text: "Whitelist (all regions)" }));
+    sec.appendChild(el("h3", { text: "Filtering" }));
+    const options = Object.entries(USER_FILTERS).map(([value, x]) => ({ value, label: x.label }));
+    const row = selectRow("User filter", prof.userFilter, options, (v) => { prof.userFilter = v; saveSettings(); refreshUI(); });
+    row.title = "Whitelist: events by the listed editors are ignored. Blacklist: only the listed editors' events are reported. Region lists belong to this region; Region + Global checks both lists. Update Requests and new-road suggestions carry no editor and always pass.";
+    sec.appendChild(row);
+    sec.appendChild(el("div", { class: "was-muted", text: f.mode === "whitelist"
+      ? "Events by the listed editors are ignored in this region."
+      : "Only the listed editors' events are reported in this region." }));
+
+    const globalTitle = f.mode === "whitelist" ? "Global Whitelist" : "Global Blacklist";
+    const globalBtn = el("button", {
+      class: "was-btn secondary",
+      text: `Edit ${globalTitle}`,
+      title: `Open the ${globalTitle} on the Settings tab`,
+      onclick: () => { activeTab = "settings"; scrollTarget = f.mode === "whitelist" ? "was-global-whitelist" : "was-global-blacklist"; refreshUI(); },
+    });
+    if (f.region) {
+      frag.appendChild(sec);
+      const title = f.mode === "whitelist" ? "Region Whitelist" : "Region Blacklist";
+      const hint = f.mode === "whitelist"
+        ? `Editors ignored in ${regionLabel(prof)}${f.global ? ", in addition to the Global Whitelist" : ""}.`
+        : `The only editors reported in ${regionLabel(prof)}${f.global ? ", together with the Global Blacklist" : ""}.`;
+      frag.appendChild(buildUserListSection(title, prof, f.mode, hint, null, [globalBtn]));
+    } else {
+      sec.appendChild(el("div", { class: "was-btns", style: "margin-top:8px" }, [globalBtn]));
+      frag.appendChild(sec);
+    }
+    return frag;
+  }
+
+  // An editor list (owner[key]): chips with remove buttons, an add box that
+  // lists the editors visible in the current map view when clicked into, and
+  // optional extra buttons at the end.
+  let userListSeq = 0;
+  function buildUserListSection(title, owner, key, hint, id, extras) {
+    const sec = el("div", { class: "was-section" });
+    if (id) sec.id = id;
+    sec.appendChild(el("h3", { text: title }));
+    if (hint) sec.appendChild(el("div", { class: "was-muted", style: "margin-bottom:6px", text: hint }));
+    const list = () => owner[key] || (owner[key] = []);
+    const has = (v) => list().some((n) => n.toLowerCase() === v.toLowerCase());
 
     const chips = el("div");
     const renderChips = () => {
       chips.innerHTML = "";
-      for (const name of settings.whitelist) {
+      for (const name of list()) {
         const chip = el("span", { class: "was-chip", text: name });
-        chip.appendChild(el("button", { title: "Remove from whitelist", text: "×", onclick: () => { settings.whitelist = settings.whitelist.filter((n) => n !== name); saveSettings(); renderChips(); } }));
+        chip.appendChild(el("button", { title: `Remove from the ${title}`, text: "×", onclick: () => { owner[key] = list().filter((n) => n !== name); saveSettings(); renderChips(); } }));
         chips.appendChild(chip);
       }
     };
 
-    const listId = "was-user-datalist";
+    const listId = `was-user-datalist-${++userListSeq}`;
     const datalist = el("datalist", { id: listId });
     const fillDatalist = (names) => {
       datalist.innerHTML = "";
@@ -3553,12 +3807,13 @@
     };
     fillDatalist(seenUsernames);
 
-    const input = el("input", { type: "text", placeholder: "Add a username…", list: listId });
+    const input = el("input", { type: "text", placeholder: "Add a username…", list: listId, title: "Click into the box to list the editors in the current map view" });
     const addBtn = el("button", { class: "was-btn secondary", text: "Add" });
+    const found = el("div", { class: "was-search-results" });
     const add = (name) => {
       const v = (name != null ? name : input.value).trim();
-      if (v && !settings.whitelist.some((n) => n.toLowerCase() === v.toLowerCase())) {
-        settings.whitelist.push(v);
+      if (v && !has(v)) {
+        list().push(v);
         saveSettings();
         renderChips();
       }
@@ -3567,18 +3822,25 @@
     addBtn.addEventListener("click", () => add());
     input.addEventListener("keydown", (e) => { if (e.key === "Enter") add(); });
 
-    // Auto-fill: pull the editors visible in the current map view.
-    const found = el("div", { class: "was-search-results" });
-    const scanBtn = el("button", { class: "was-btn secondary", title: "List editors currently visible in the map view to whitelist", text: "Find editors in view" });
-    scanBtn.addEventListener("click", async () => {
-      const names = (await scrapeAreaUsernames()).sort((a, b) => a.localeCompare(b));
-      fillDatalist(names);
-      found.innerHTML = "";
-      const fresh = names.filter((n) => !settings.whitelist.some((w) => w.toLowerCase() === n.toLowerCase()));
-      if (!fresh.length) { found.appendChild(el("div", { class: "was-muted", text: "No new editors in the current view." })); return; }
-      found.appendChild(el("div", { class: "was-muted", text: `${fresh.length} found — click to whitelist.` }));
-      for (const n of fresh) {
-        found.appendChild(el("div", { text: n, onclick: () => { add(n); found.innerHTML = ""; } }));
+    // Clicking into the box lists the editors visible in the current map view.
+    let scanning = false;
+    input.addEventListener("focus", async () => {
+      if (scanning) return;
+      scanning = true;
+      try {
+        const names = (await scrapeAreaUsernames()).sort((a, b) => a.localeCompare(b));
+        fillDatalist(names);
+        found.innerHTML = "";
+        const fresh = names.filter((n) => !has(n));
+        if (!fresh.length) { found.appendChild(el("div", { class: "was-muted", text: "No new editors in the current view." })); return; }
+        found.appendChild(el("div", { class: "was-muted", text: `${fresh.length} editor${fresh.length === 1 ? "" : "s"} in view — click to add.` }));
+        for (const n of fresh) {
+          const item = el("div", { text: n });
+          item.addEventListener("click", () => { add(n); item.remove(); });
+          found.appendChild(item);
+        }
+      } finally {
+        scanning = false;
       }
     });
 
@@ -3586,8 +3848,8 @@
     sec.appendChild(datalist);
     renderChips();
     sec.appendChild(chips);
-    sec.appendChild(el("div", { class: "was-btns", style: "margin-top:8px" }, [scanBtn]));
     sec.appendChild(found);
+    if (extras && extras.length) sec.appendChild(el("div", { class: "was-btns", style: "margin-top:8px" }, extras));
     return sec;
   }
 
@@ -3610,7 +3872,7 @@
       text: "Load",
       title: "Replace all settings with a saved JSON file",
       onclick: () => {
-        if (!confirm("Loading a settings file overwrites ALL current settings: every region, the scanner choices and the whitelist. This can't be undone.\n\nContinue and choose a file?")) return;
+        if (!confirm("Loading a settings file overwrites ALL current settings: every region, the scanner choices and every whitelist and blacklist. This can't be undone.\n\nContinue and choose a file?")) return;
         file.click();
       },
     });
@@ -3690,7 +3952,7 @@
       const info = await sdk.State.getUserInfo();
       if (info && info.userName) {
         selfUserName = info.userName;
-        noteUsername(info.userName);
+        noteUsername(info.userName, info.rank);
       }
     } catch (e) {}
     if (!settings.whitelistSeeded) {
