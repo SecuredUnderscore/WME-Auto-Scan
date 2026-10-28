@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME Auto Scan
 // @namespace    https://github.com/SecuredUnderscore/WME-Auto-Scan
-// @version      0.6.1
+// @version      0.7.0
 // @description  Scans a selected area in Waze Map Editor for road closures, user edits, update requests, place update requests, and map suggestions, and sends notifications to Discord or Pushover.
 // @author       SecuredUnderscore
 // @match        https://www.waze.com/editor*
@@ -37,7 +37,7 @@
   // ---------------------------------------------------------------------------
   const SCRIPT_ID = "wme-auto-scan";
   const SCRIPT_NAME = "WME Auto Scan";
-  const SCRIPT_VERSION = "0.6.1"; // keep in sync with @version above
+  const SCRIPT_VERSION = "0.7.0"; // keep in sync with @version above
   const STORAGE_KEY = "wme-auto-scan:settings:v1";
 
   // --- Map API scanning ----------------------------------------------------
@@ -65,6 +65,11 @@
   // scan's request boxes). Drawn on demand and cleared as soon as the zoom
   // changes or the user toggles a preview off.
   const REGION_PREVIEW_LAYER = "wme-auto-scan-region-preview";
+  // Basemap behind the managed-area hover previews: Waze's public Live Map
+  // tiles. {s} is a server number (1-4); {z}/{x}/{y} is a standard XYZ tile.
+  const AREA_PREVIEW_TILE_URL = "https://livemap-tiles{s}.waze.com/tiles/{z}/{x}/{y}.png";
+  const AREA_PREVIEW_SIZE = [260, 190]; // preview width and height, px
+  const AREA_PREVIEW_MAX_ZOOM = 17;
   const BBOX_PREVIEW_LAYER = "wme-auto-scan-bbox-preview";
   const MAX_PREVIEW_BOXES = 5000; // cap so a huge region can't stall the map
 
@@ -884,6 +889,7 @@
 
   async function clearPreview() {
     activePreview = null;
+    syncViewSelect();
     disarmPreviewAutoClear();
     if (previewLayersReady) {
       try { await sdk.Map.removeAllFeaturesFromLayer({ layerName: REGION_PREVIEW_LAYER }); } catch (e) {}
@@ -927,6 +933,7 @@
       await sdk.Map.addFeaturesToLayer({ features: [polygonRingFeature("region", region.coordinates)], layerName: REGION_PREVIEW_LAYER });
       await sdk.Map.zoomToExtent({ bbox: bboxOfRing(region.coordinates[0]) });
       activePreview = "region";
+      syncViewSelect();
       armPreviewAutoClear();
     } catch (e) {
       console.error("[WME Auto Scan] region preview failed", e);
@@ -950,6 +957,7 @@
       await sdk.Map.addFeaturesToLayer({ features: tiles.map((t, i) => boxFeature("box" + i, t.box)), layerName: BBOX_PREVIEW_LAYER });
       await sdk.Map.zoomToExtent({ bbox: bboxOfRing(region.coordinates[0]) });
       activePreview = "boxes";
+      syncViewSelect();
       armPreviewAutoClear();
       setStatus(capped
         ? `Showing first ${MAX_PREVIEW_BOXES} of ${finest.tiles.length} ${finest.label} requests. Zoom to clear.`
@@ -960,14 +968,21 @@
     }
   }
 
-  function toggleRegionPreview() {
-    if (activePreview === "region") { clearPreview(); return; }
-    previewRegion();
+  // Show what the sidebar's "View on map" dropdown asks for: "" (nothing),
+  // "region" (the area's outline) or "boxes" (one scan's request boxes).
+  function showPreview(kind) {
+    if (kind === "region") previewRegion();
+    else if (kind === "boxes") previewScanBoxes();
+    else clearPreview();
   }
 
-  function toggleBoxesPreview() {
-    if (activePreview === "boxes") { clearPreview(); return; }
-    previewScanBoxes();
+  // The sidebar is rebuilt on refresh, but previews also clear on zoom, so the
+  // View buttons are kept in step here instead of by a full refresh.
+  function syncViewSelect() {
+    for (const kind of Object.keys(viewButtons)) {
+      const b = viewButtons[kind];
+      if (b && b.isConnected) b.textContent = activePreview === kind ? "Hide" : "View";
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -2906,12 +2921,12 @@
 
   const STYLE = `
     /* Light theme to sit inside WME's white sidebar. */
-    .was-wrap {
+    .was-wrap, .was-area-tip {
       --was-text: #202324; --was-muted: #5c6670; --was-border: #d9dde1;
       --was-input-border: #c2c8ce; --was-surface: #ffffff; --was-subtle: #f5f7f9;
       --was-hover: #eef1f4; --was-accent: #0b7fd4;
-      font-size: 12px; line-height: 1.4; padding: 6px 4px 40px; color: var(--was-text);
     }
+    .was-wrap { font-size: 12px; line-height: 1.4; padding: 6px 4px 40px; color: var(--was-text); }
     .was-wrap h2 { font-size: 15px; margin: 0 0 8px; color: var(--was-text); }
     .was-wrap h2 .was-version { font-size: 13px; font-weight: normal; margin-left: 6px; color: var(--was-muted); }
 
@@ -2948,12 +2963,20 @@
     .was-pill.on { color: #15803d; }
     .was-pill.off { color: #b45309; }
 
-    .was-region-current { font-size: 15px; font-weight: 700; color: var(--was-text); margin-bottom: 2px; }
-
-    .was-eye { cursor: pointer; border: 1px solid var(--was-input-border); background: var(--was-surface);
-      border-radius: 5px; padding: 2px 8px; font-size: 14px; line-height: 1.2; color: var(--was-text); }
-    .was-eye:hover { background: var(--was-hover); }
-    .was-eye:disabled { opacity: .45; cursor: not-allowed; }
+    /* Label / value summary (Scan area). */
+    .was-kv { display: grid; grid-template-columns: max-content 1fr; gap: 8px 12px; align-items: start; margin-bottom: 10px; }
+    .was-kv .k { font-weight: 600; color: var(--was-muted); white-space: nowrap; }
+    .was-kv .v { min-width: 0; color: var(--was-text); overflow-wrap: anywhere; }
+    .was-kv .v.big { font-size: 14px; font-weight: 700; }
+    .was-kv .k { align-self: start; padding-top: 2px; }
+    .was-size-list { display: flex; flex-direction: column; gap: 3px; }
+    .was-size-item { display: flex; align-items: center; gap: 8px; }
+    .was-size-item .name { display: inline-block; min-width: 110px; padding: 2px 8px; border: 1px solid var(--was-border);
+      border-radius: 4px; background: var(--was-subtle); color: var(--was-text); text-align: center; }
+    .was-size-item .count { font-weight: 700; color: var(--was-text); }
+    .was-view-rows { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--was-border); }
+    .was-view-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .was-view-row .was-btn { padding: 3px 10px; }
 
     .was-chip { display: inline-flex; align-items: center; gap: 4px; background: var(--was-hover);
       border: 1px solid var(--was-border); border-radius: 12px; padding: 2px 8px; margin: 2px; font-size: 11px; color: var(--was-text); }
@@ -2989,6 +3012,19 @@
     .was-search-results { max-height: 140px; overflow: auto; margin-top: 6px; }
     .was-search-results div { padding: 5px 7px; border-radius: 4px; cursor: pointer; }
     .was-search-results div:hover { background: var(--was-hover); }
+
+    /* Managed-area list; hovering an entry pops a map preview beside the sidebar. */
+    .was-area-list { max-height: 160px; overflow: auto; border: 1px solid var(--was-input-border); border-radius: 4px; background: var(--was-surface); }
+    .was-area-list div { padding: 5px 7px; cursor: pointer; }
+    .was-area-list div:hover, .was-area-list div:focus { background: var(--was-hover); outline: none; }
+    .was-area-list div.selected { font-weight: 700; color: var(--was-accent); }
+    .was-area-list div.empty { cursor: default; }
+    .was-area-tip { position: fixed; z-index: 100000; pointer-events: none; padding: 6px; font-size: 12px; line-height: 1.4; color: var(--was-text);
+      background: var(--was-surface); border: 1px solid var(--was-border); border-radius: 6px; box-shadow: 0 4px 16px rgba(0,0,0,.25); }
+    .was-area-tip .name { font-weight: 600; margin-bottom: 4px; }
+    .was-minimap { position: relative; overflow: hidden; border-radius: 4px; background: #dde6ec; }
+    .was-minimap img { position: absolute; width: 256px; height: 256px; }
+    .was-minimap svg { position: absolute; left: 0; top: 0; }
 
     /* Floating status bar over the map while Running. */
     .was-bar { position: absolute; top: 31px; left: 50%; transform: translateX(-50%); width: 50%; z-index: 2000;
@@ -3033,7 +3069,9 @@
   let scrollTarget = null; // element id to scroll to after the next refreshUI()
   let regionMethod = ""; // Choose-New-Region mode: "", "managed", "search", "draw"
   let regionDraft = null; // { label, coordinates } staged region, committed on Save
-  let regionChooserOpen = false; // "Choose New Region" dropdown; collapsed until opened
+  let regionChooserOpen = false; // "Change area" dropdown; collapsed until opened
+  let optimizeOpen = false; // "Optimization" dropdown; collapsed until opened
+  let viewButtons = {}; // the "View" buttons by preview kind, kept in step with activePreview
   let wktText = ""; // WKT pasted for the "WKT Format" method (kept across re-renders)
   let wktError = ""; // why the pasted WKT couldn't be used
 
@@ -3172,6 +3210,7 @@
 
   function refreshUI() {
     if (!tabPane) return;
+    hideAreaTip();
     tabPane.innerHTML = "";
     const wrap = el("div", { class: "was-wrap" });
 
@@ -3348,6 +3387,7 @@
     regionDraft = null;
     regionMethod = "";
     regionChooserOpen = false;
+    optimizeOpen = false;
     wktText = "";
     wktError = "";
     clearPreview();
@@ -3397,34 +3437,81 @@
   function buildRegionSection() {
     const sec = el("div", { class: "was-section" });
     sec.appendChild(el("h3", { text: "Scan area" }));
+    const region = selectedRegion().region;
+    const hasRegion = !!(region && region.coordinates);
+    if (!hasRegion) regionChooserOpen = true; // nothing else to do yet
 
-    // Current region, with an eye button that zooms to it and outlines it.
-    const head = el("div", { style: "display:flex; align-items:center; gap:8px; margin-bottom:8px" });
-    const label = selectedRegion().region ? selectedRegion().region.label : "No area selected";
-    head.appendChild(el("div", { class: "was-region-current", text: label, style: "flex:1; margin:0" }));
-    if (selectedRegion().region && selectedRegion().region.coordinates) {
-      head.appendChild(el("button", { class: "was-eye", title: "Show this region on the map", text: "👁", onclick: toggleRegionPreview }));
+    // --- Summary: what this region scans, at a glance.
+    const kv = el("div", { class: "was-kv" });
+    const row = (key, value, title) => {
+      kv.appendChild(el("div", { class: "k", text: key }));
+      const cell = el("div", { class: "v" });
+      if (typeof value === "string") cell.textContent = value; else cell.appendChild(value);
+      if (title) cell.title = title;
+      kv.appendChild(cell);
+      return cell;
+    };
+    row("Area", hasRegion ? region.label : "None yet. Pick one below.", hasRegion ? "The area this region scans" : "").classList.add("big");
+    if (hasRegion) row("Scan size", buildScanSizeList(), "How many requests one scan makes, per scan type. Fewer is faster.");
+    sec.appendChild(kv);
+
+    sec.appendChild(buildChangeAreaBox());
+    if (hasRegion) {
+      sec.appendChild(buildOptimizeBox());
+      sec.appendChild(buildViewRows());
     }
-    sec.appendChild(head);
-    if (selectedRegion().region && selectedRegion().region.coordinates) sec.appendChild(buildOptimizeRow());
+    return sec;
+  }
 
-    // --- Choose New Region: the same framed dropdown as Notifications (closed
-    // by default) holding the three pick methods, the staged pick and Save.
-    // The sidebar is rebuilt on every refresh, so its open state lives in
-    // regionChooserOpen.
-    const chooserBox = el("div", { class: "was-hook" + (regionChooserOpen ? " open" : ""), style: "margin-bottom:8px" });
-    chooserBox.appendChild(el("div", { class: "was-hook-title", text: "Choose New Region" }));
-    chooserBox.appendChild(el("span", { class: "chev", text: "▾" }));
+  // Requests one scan makes, per scan type, whether or not that scanner is on.
+  // Sits in the value column of the summary grid.
+  function buildScanSizeList() {
+    const names = { closures: "Road Closures", edits: "User Edits", issues: "Map Issues" };
+    const list = el("div", { class: "was-size-list" });
+    try {
+      for (const p of plannedPasses(["closure", "edit", "report", "suggestion", "placeRequest"])) {
+        list.appendChild(el("div", { class: "was-size-item" }, [
+          el("span", { class: "name", text: names[p.label] || p.label }),
+          el("span", { class: "count", text: String(p.tiles.length) }),
+        ]));
+      }
+    } catch (e) { list.appendChild(el("div", { class: "was-muted", text: "Couldn't plan the scan: " + e.message })); }
+    return list;
+  }
+
+  // Two "View" rows at the foot of the section: the area's outline, and the
+  // boxes one scan requests. The button reads Hide while its preview is up.
+  function buildViewRows() {
+    viewButtons = {};
+    const wrap = el("div", { class: "was-view-rows" });
+    for (const [kind, label, help] of [
+      ["region", "Area Outline", "Draw this area's outline on the map. Zooming clears it."],
+      ["boxes", "Scanned Regions", "Draw the boxes one scan requests on the map. Zooming clears it."],
+    ]) {
+      const btn = el("button", { class: "was-btn secondary", text: activePreview === kind ? "Hide" : "View", title: help, onclick: () => showPreview(activePreview === kind ? "" : kind) });
+      viewButtons[kind] = btn;
+      wrap.appendChild(el("div", { class: "was-view-row" }, [el("span", { text: label }), btn]));
+    }
+    return wrap;
+  }
+
+  // --- Change area: the same framed dropdown as Notifications (closed by
+  // default) holding the pick methods, the staged pick and Save. The sidebar
+  // is rebuilt on every refresh, so its open state lives in regionChooserOpen.
+  function buildChangeAreaBox() {
+    const box = el("div", { class: "was-hook" + (regionChooserOpen ? " open" : ""), style: "margin-bottom:8px" });
+    box.appendChild(el("div", { class: "was-hook-title", text: "Change area" }));
+    box.appendChild(el("span", { class: "chev", text: "▾" }));
     const body = el("div", { class: "was-hook-panel" });
     body.addEventListener("click", (e) => e.stopPropagation()); // picking never toggles
-    chooserBox.appendChild(body);
-    chooserBox.addEventListener("click", () => {
+    box.appendChild(body);
+    box.addEventListener("click", () => {
       regionChooserOpen = !regionChooserOpen;
-      chooserBox.classList.toggle("open", regionChooserOpen);
+      box.classList.toggle("open", regionChooserOpen);
     });
 
     const chooser = el("select");
-    for (const [value, text] of [["", "Choose a method…"], ["managed", "Managed area"], ["search", "Search for a place"], ["draw", "Draw on map"], ["wkt", "WKT Format"]]) {
+    for (const [value, text] of [["", "How do you want to pick it?"], ["managed", "Managed area"], ["search", "Search for a place"], ["draw", "Draw on map"], ["wkt", "WKT Format"]]) {
       chooser.appendChild(el("option", { value, text }));
     }
     chooser.value = regionMethod;
@@ -3445,7 +3532,7 @@
     }
     const saveBtn = el("button", {
       class: "was-btn go",
-      title: "Save the selected area as your scan region",
+      title: "Save the selected area as this region's scan area",
       text: "Save",
       onclick: () => {
         if (!regionDraft) return;
@@ -3461,33 +3548,161 @@
     });
     if (!regionDraft) saveBtn.disabled = true;
     body.appendChild(el("div", { class: "was-btns" }, [saveBtn]));
-    sec.appendChild(chooserBox);
-
-    sec.appendChild(buildScanAreasRow());
-    return sec;
+    return box;
   }
 
   // Presets come from async SDK calls, so the list fills in after render; the
   // last result is kept so the re-render after a pick shows it immediately.
+  // Native <option>s can't be hovered in every browser, so the areas are a
+  // plain list: hovering (or focusing) an entry shows a map preview of it.
   let managedPresetsCache = null;
   function buildManagedAreaPicker() {
-    const row = el("div", { class: "was-row" });
-    const select = el("select");
-    row.appendChild(select);
+    const wrap = el("div", { class: "was-row" });
+    wrap.appendChild(el("div", { class: "was-muted", text: "Hover an area to preview it on a map.", style: "margin-bottom:4px" }));
+    const list = el("div", { class: "was-area-list", role: "listbox" });
+    wrap.appendChild(list);
+    list.addEventListener("scroll", hideAreaTip);
     const fill = (presets) => {
-      select.innerHTML = "";
-      select.appendChild(el("option", { value: "", text: presets.length ? "Choose a managed area…" : "No managed areas found on your account." }));
-      presets.forEach((p, i) => select.appendChild(el("option", { value: String(i), text: p.label })));
+      list.innerHTML = "";
+      if (!presets.length) {
+        list.appendChild(el("div", { class: "was-muted empty", text: "No managed areas found on your account." }));
+        return;
+      }
+      presets.forEach((p) => {
+        const key = areaPreviewKey(p);
+        const selected = !!(regionDraft && regionDraft.presetKey === key);
+        const row = el("div", { class: selected ? "selected" : "", text: p.label, tabindex: "0", role: "option", "aria-selected": String(selected) });
+        row.addEventListener("mouseenter", () => showAreaTip(row, p));
+        row.addEventListener("mouseleave", hideAreaTip);
+        row.addEventListener("focus", () => showAreaTip(row, p));
+        row.addEventListener("blur", hideAreaTip);
+        row.addEventListener("click", () => {
+          regionDraft = { label: p.label, coordinates: p.coordinates, presetKey: key };
+          refreshUI();
+        });
+        row.addEventListener("keydown", (e) => {
+          if (e.key === "Enter" || e.key === " ") { e.preventDefault(); row.click(); }
+        });
+        list.appendChild(row);
+      });
+      // Build every preview now (off-screen) so the tiles are already cached
+      // by the time an entry is hovered.
+      setTimeout(() => presets.forEach((p) => areaPreviewFor(p)), 0);
     };
-    select.addEventListener("change", () => {
-      if (select.value === "") { regionDraft = null; return; }
-      const p = (managedPresetsCache || [])[Number(select.value)];
-      if (p) { regionDraft = { label: p.label, coordinates: p.coordinates }; refreshUI(); }
-    });
     if (managedPresetsCache) fill(managedPresetsCache);
-    else select.appendChild(el("option", { value: "", text: "Loading managed areas…" }));
+    else list.appendChild(el("div", { class: "was-muted empty", text: "Loading managed areas…" }));
     managedAreaPresets().then((presets) => { managedPresetsCache = presets; fill(presets); });
-    return row;
+    return wrap;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Managed-area hover previews: a small static map (Live Map tiles) with the
+  // area outlined on top, built once per area and reused across re-renders.
+  // ---------------------------------------------------------------------------
+  const areaPreviewCache = new Map(); // preview key -> .was-minimap element
+  let areaTip = null; // the one tooltip element, while shown
+
+  // Polygon coordinates are rings; a MultiPolygon is polygons of rings.
+  function polygonRings(coordinates) {
+    if (!coordinates || !coordinates.length) return [];
+    return typeof coordinates[0][0][0] === "number" ? coordinates : coordinates.flat();
+  }
+
+  function areaPreviewKey(preset) {
+    const pts = polygonRings(preset.coordinates).flat();
+    return preset.label + "|" + pts.length + "|" + bboxOfRing(pts).map((v) => v.toFixed(5)).join(",");
+  }
+
+  // Web Mercator pixel position at zoom z (256px tiles), like XYZ tile servers use.
+  function mercatorPx(lon, lat, z) {
+    const n = 256 * Math.pow(2, z);
+    const s = Math.sin((Math.max(-85.05, Math.min(85.05, lat)) * Math.PI) / 180);
+    return [((lon + 180) / 360) * n, (0.5 - Math.log((1 + s) / (1 - s)) / (4 * Math.PI)) * n];
+  }
+
+  function buildAreaMiniMap(coordinates) {
+    const [W, H] = AREA_PREVIEW_SIZE;
+    const rings = polygonRings(coordinates);
+    const box = bboxOfRing(rings.flat()); // [minLon, minLat, maxLon, maxLat]
+    // Largest zoom at which the whole area fits with a small margin.
+    let z = 1;
+    for (let cand = AREA_PREVIEW_MAX_ZOOM; cand >= 1; cand--) {
+      const [x0, y0] = mercatorPx(box[0], box[3], cand);
+      const [x1, y1] = mercatorPx(box[2], box[1], cand);
+      if (x1 - x0 <= W - 24 && y1 - y0 <= H - 24) { z = cand; break; }
+    }
+    const [x0, y0] = mercatorPx(box[0], box[3], z);
+    const [x1, y1] = mercatorPx(box[2], box[1], z);
+    const ox = Math.round((x0 + x1) / 2 - W / 2);
+    const oy = Math.round((y0 + y1) / 2 - H / 2);
+    const n = Math.pow(2, z);
+
+    const map = el("div", { class: "was-minimap", style: `width:${W}px;height:${H}px` });
+    for (let tx = Math.floor(ox / 256); tx * 256 < ox + W; tx++) {
+      for (let ty = Math.floor(oy / 256); ty * 256 < oy + H; ty++) {
+        if (ty < 0 || ty >= n) continue;
+        const wx = ((tx % n) + n) % n; // wrap around the antimeridian
+        const src = AREA_PREVIEW_TILE_URL
+          .replace("{s}", String(1 + (Math.abs(wx + ty) % 4)))
+          .replace("{z}", String(z)).replace("{x}", String(wx)).replace("{y}", String(ty));
+        const img = el("img", { src, alt: "", style: `left:${tx * 256 - ox}px;top:${ty * 256 - oy}px` });
+        img.addEventListener("error", () => img.remove()); // missing tile: plain background shows through
+        map.appendChild(img);
+      }
+    }
+
+    const d = rings.map((ring) => ring.map(([lon, lat], i) => {
+      const [x, y] = mercatorPx(lon, lat, z);
+      return (i ? "L" : "M") + (x - ox).toFixed(1) + " " + (y - oy).toFixed(1);
+    }).join("") + "Z").join("");
+    const svgNS = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(svgNS, "svg");
+    svg.setAttribute("width", String(W));
+    svg.setAttribute("height", String(H));
+    const path = document.createElementNS(svgNS, "path");
+    path.setAttribute("d", d);
+    path.setAttribute("fill", "#0b7fd4");
+    path.setAttribute("fill-opacity", "0.15");
+    path.setAttribute("fill-rule", "evenodd");
+    path.setAttribute("stroke", "#0b7fd4");
+    path.setAttribute("stroke-width", "2");
+    path.setAttribute("stroke-linejoin", "round");
+    svg.appendChild(path);
+    map.appendChild(svg);
+    return map;
+  }
+
+  function areaPreviewFor(preset) {
+    const key = areaPreviewKey(preset);
+    let map = areaPreviewCache.get(key);
+    if (!map) {
+      try { map = buildAreaMiniMap(preset.coordinates); } catch (e) { return null; }
+      areaPreviewCache.set(key, map);
+    }
+    return map;
+  }
+
+  // Show the preview beside the hovered row: to its right, or to the left if
+  // there's no room, and kept inside the viewport.
+  function showAreaTip(row, preset) {
+    hideAreaTip();
+    const map = areaPreviewFor(preset);
+    if (!map) return;
+    areaTip = el("div", { class: "was-area-tip" }, [el("div", { class: "name", text: preset.label }), map]);
+    document.body.appendChild(areaTip);
+    const r = row.getBoundingClientRect();
+    const t = areaTip.getBoundingClientRect();
+    let left = r.right + 10;
+    if (left + t.width > window.innerWidth - 8) left = Math.max(8, r.left - t.width - 10);
+    const top = Math.max(8, Math.min(r.top, window.innerHeight - t.height - 8));
+    areaTip.style.left = left + "px";
+    areaTip.style.top = top + "px";
+  }
+
+  function hideAreaTip() {
+    if (!areaTip) return;
+    areaTip.remove();
+    areaTip = null;
   }
 
   // "WKT Format": paste a POLYGON (e.g. drawn on map.wazedev.com) and stage it.
@@ -3576,76 +3791,62 @@
     return wrap;
   }
 
-  // Optimization status + control (Road closures + User edits), shown under the current region.
-  function buildOptimizeRow() {
-    const wrap = el("div", { style: "margin:-2px 0 10px", title: OPTIMIZE_HELP });
-    const mask = loadMask(selectedRegion().region);
+  // --- Optimization: a framed dropdown whose title carries the status
+  // (Optimized / Not optimized / Paused / Running / Outdated); the panel holds
+  // the detail, the Optimize and Clear buttons and what optimizing does.
+  function buildOptimizeBox() {
+    const region = selectedRegion().region;
+    const mask = loadMask(region);
     const optimized = !!(mask && mask.complete);
-    const total = regionTiles(selectedRegion().region.coordinates, ROAD_TILE_DEG).length;
-    const btns = el("div", { class: "was-btns", style: "align-items:center" });
+    const resuming = !!(mask && !mask.complete);
+    const stale = optimized && maskIsStale(mask);
+    const total = regionTiles(region.coordinates, ROAD_TILE_DEG).length;
+    const busy = scanState.running || scanState.scheduled;
 
+    const box = el("div", { class: "was-hook" + (optimizeOpen ? " open" : ""), style: "margin-bottom:8px" });
+    const title = el("div", { class: "was-hook-title", text: "Optimization: " });
+    let status, cls;
+    if (optimizeState.running) { status = `Running ${optimizeState.tilesDone}/${optimizeState.tilesTotal}`; cls = "on"; }
+    else if (stale) { status = "Outdated"; cls = "off"; }
+    else if (optimized) { status = "Optimized"; cls = "on"; }
+    else if (resuming) { status = `Paused ${mask.nextIndex}/${total}`; cls = "off"; }
+    else { status = "Not optimized"; cls = "off"; }
+    title.appendChild(el("span", { class: "was-pill " + cls, text: status }));
+    box.appendChild(title);
+    box.appendChild(el("span", { class: "chev", text: "▾" }));
+    const panel = el("div", { class: "was-hook-panel" });
+    panel.addEventListener("click", (e) => e.stopPropagation());
+    box.appendChild(panel);
+    box.addEventListener("click", () => {
+      optimizeOpen = !optimizeOpen;
+      box.classList.toggle("open", optimizeOpen);
+    });
+
+    panel.appendChild(el("div", { class: "was-muted", text: "Optimization makes the scanner skip areas that don't contain Segments or Places.", style: "margin-bottom:8px" }));
+
+    const btns = el("div", { class: "was-btns" });
     if (optimizeState.running) {
       btns.appendChild(el("button", { class: "was-btn danger", text: "Stop", title: "Pause optimization. Progress is saved and can be resumed.", onclick: stopOptimize }));
-      btns.appendChild(el("span", { class: "was-muted", text: `Optimizing… ${optimizeState.tilesDone}/${optimizeState.tilesTotal}` }));
     } else {
-      const resuming = mask && !mask.complete;
-      const label = optimized ? "Re-optimize" : resuming ? "Resume optimizing" : "Optimize";
       const optBtn = el("button", {
-        class: "was-btn " + (optimized ? "secondary" : "go"),
-        text: label,
+        class: "was-btn " + (optimized && !stale ? "secondary" : "go"),
+        text: optimized ? "Optimize again" : resuming ? "Resume" : "Optimize",
         title: OPTIMIZE_HELP,
         onclick: () => {
-          if (optimized && !confirm("This region is already optimized. Optimize it again?")) return;
+          if (optimized && !confirm("This area is already optimized. Optimize it again?")) return;
           runOptimize();
         },
       });
-      const busy = scanState.running || scanState.scheduled;
-      if (busy) {
-        optBtn.disabled = true;
-        optBtn.title = "Stop scanning to optimize. " + OPTIMIZE_HELP;
-      }
+      if (busy) { optBtn.disabled = true; optBtn.title = "Stop scanning to optimize. " + OPTIMIZE_HELP; }
       btns.appendChild(optBtn);
-
-      const pill = optimized
-        ? el("span", { class: "was-pill on", text: "Optimized", title: `${mask.productive.length} of ${total} areas have road segments; Road closures and User edits skip the rest. Built ${new Date(mask.builtAt).toLocaleDateString()}.` })
-        : el("span", { class: "was-pill off", text: resuming ? `Paused ${mask.nextIndex}/${total}` : "Not optimized", title: OPTIMIZE_HELP });
-      btns.appendChild(pill);
-
       if (mask) {
-        const clearBtn = el("button", { class: "was-btn secondary", text: "Clear", title: "Discard this region's optimization; Road closures and User edits go back to the whole region.", onclick: () => { clearMask(selectedRegion().region); refreshUI(); } });
+        const clearBtn = el("button", { class: "was-btn secondary", text: "Clear", title: "Forget this area's optimization. Road closures and User edits go back to scanning the whole area.", onclick: () => { clearMask(region); refreshUI(); } });
         if (busy) clearBtn.disabled = true;
         btns.appendChild(clearBtn);
       }
     }
-    wrap.appendChild(btns);
-    wrap.appendChild(el("div", { class: "was-muted", text: "Applies to Road closures and User edits.", style: "margin-top:4px" }));
-    if (optimized && maskIsStale(mask)) {
-      wrap.appendChild(el("div", { class: "was-muted", text: `Optimized over ${MASK_STALE_DAYS} days ago. Optimize again so new roads are covered.`, style: "margin-top:4px; color:#b45309" }));
-    }
-    return wrap;
-  }
-
-  // How many requests a scan of this region makes, per pass, plus the eye that
-  // draws them. Shown inside the region section.
-  function buildScanAreasRow() {
-    const wrap = el("div", { style: "margin-top:10px; padding-top:8px; border-top:1px solid var(--was-border)" });
-    const hasRegion = !!(selectedRegion().region && selectedRegion().region.coordinates);
-    const btns = el("div", { class: "was-btns", style: "align-items:center" });
-    const eye = el("button", { class: "was-eye", title: "Show the scan's request boxes on the map", text: "👁", onclick: toggleBoxesPreview });
-    if (!hasRegion) eye.disabled = true;
-    btns.appendChild(eye);
-    let summary = "Choose a region to see its scan size.";
-    if (hasRegion) {
-      try {
-        const passes = plannedPasses();
-        summary = passes.length
-          ? "Requests per scan: " + passes.map((p) => `${p.tiles.length} ${p.label}${p.optimized ? " (optimized)" : ""}`).join(" · ")
-          : "Turn on a scanner to see its scan size.";
-      } catch (e) { summary = "Couldn't plan the scan: " + e.message; }
-    }
-    btns.appendChild(el("span", { class: "was-muted", text: summary }));
-    wrap.appendChild(btns);
-    return wrap;
+    panel.appendChild(btns);
+    return box;
   }
 
   function textRow(labelText, value, onInput, type = "text") {
@@ -3688,8 +3889,13 @@
     regionName.addEventListener("change", () => { g.regionInTitle = regionName.checked; saveSettings(); });
     sec.appendChild(el("label", { class: "was-check", title: "Start every alert's title with the region's name in brackets, e.g. \"[Downtown] Road closure\"." }, [regionName, el("span", { text: "Include Region Name In Alerts" })]));
 
-    const intervalRow = textRow("Scan interval (minutes)", g.scanIntervalMin, (v) => { g.scanIntervalMin = Math.max(1, Number(v) || 1); saveSettings(); }, "number");
-    intervalRow.title = "Minutes between scans of a region. Every region is scanned on this interval, one at a time.";
+    const intervalRow = textRow("Scan interval (minutes)", g.scanIntervalMin, (v) => { g.scanIntervalMin = Math.max(1, Math.floor(Number(v)) || 1); saveSettings(); }, "number");
+    intervalRow.title = "Minutes between scans of a region (minimum 1). Every region is scanned on this interval, one at a time.";
+    const intervalInput = intervalRow.querySelector("input");
+    intervalInput.min = "1";
+    intervalInput.step = "1";
+    // Snap the field back to the stored (clamped) value when the user leaves it.
+    intervalInput.addEventListener("change", () => { intervalInput.value = String(g.scanIntervalMin); });
     sec.appendChild(intervalRow);
     return sec;
   }
