@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WME Auto Scan
 // @namespace    https://github.com/SecuredUnderscore/WME-Auto-Scan
-// @version      0.7.0
+// @version      0.7.1
 // @description  Scans a selected area in Waze Map Editor for road closures, user edits, update requests, place update requests, and map suggestions, and sends notifications to Discord or Pushover.
 // @author       SecuredUnderscore
 // @match        https://www.waze.com/editor*
@@ -37,7 +37,7 @@
   // ---------------------------------------------------------------------------
   const SCRIPT_ID = "wme-auto-scan";
   const SCRIPT_NAME = "WME Auto Scan";
-  const SCRIPT_VERSION = "0.7.0"; // keep in sync with @version above
+  const SCRIPT_VERSION = "0.7.1"; // keep in sync with @version above
   const STORAGE_KEY = "wme-auto-scan:settings:v1";
 
   // --- Map API scanning ----------------------------------------------------
@@ -1667,12 +1667,19 @@
       async finalize() {
         const items = [...requestsById.values()];
         const store = seenFor(scanState.profile, "report");
-        // Which requests are newly seen this scan (and recent enough to be
-        // new, see freshnessCutoff)? Then mark everything seen.
-        const cutoff = freshnessCutoff(store);
+        // Which requests are new? Not freshnessCutoff: a UR's only timestamp is
+        // driveDate — when the driver drove, often hours before the report was
+        // filed and showed up — so nearly every new UR looked stale. UR ids are
+        // assigned in creation order, so a new UR has a higher id than any this
+        // region has seen; an old one the server dropped for a scan and sent
+        // back doesn't. Then mark everything seen.
+        const prevMaxId = store.maxId || 0;
         store.lastScanAt = Date.now();
-        const fresh = items.filter((r) => !store.ids.has(String(r.id)) && !isStale(r.reportedOn, cutoff));
-        for (const r of items) store.ids.add(String(r.id));
+        const fresh = items.filter((r) => !store.ids.has(String(r.id)) && Number(r.id) > prevMaxId);
+        for (const r of items) {
+          store.ids.add(String(r.id));
+          if (Number(r.id) > (store.maxId || 0)) store.maxId = Number(r.id);
+        }
         if (!store.baseline) { store.baseline = true; return 0; } // silent first scan
         if (!fresh.length) return 0;
         let sent = 0;
